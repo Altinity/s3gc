@@ -31,104 +31,125 @@ usage = """
 
 parser = OptionParser(usage=usage)
 
+def oeg(envname, default=None):
+    val=os.environ.get(envname, default)
+    return None if val=='None' else val
+
 parser.add_option(
-    "--ch-host",
     "--chhost",
+    "--ch-host",
     dest="chhost",
-    default="localhost",
+    default=os.environ.get("CHHOST", "localhost"),
     help="ClickHouse host to connect to",
 )
 parser.add_option(
-    "--ch-port",
     "--chport",
+    "--ch-port",
     dest="chport",
-    default=8123,
+    default=os.environ.get("CHPORT", 8123),
     help="ClickHouse port to connect to",
 )
 parser.add_option(
+    "--chuser",
     "--ch-user-name",
     "--chusername",
     dest="chuser",
-    default="default",
+    default=os.environ.get("CHUSER", "default"),
     help="ClickHouse user name",
 )
 parser.add_option(
+    "--chpass",
     "--ch-pass",
     "--ch-password",
-    "--chpass",
     dest="chpass",
-    default="",
+    default=os.environ.get("CHPASS", ""),
     help="ClickHouse user password",
 )
 parser.add_option(
-    "--s3-ip", "--s3ip", dest="s3ip", default="127.0.0.1", help="S3 ip address"
+    "--s3ip",
+    "--s3-ip",
+    dest="s3ip",
+    default=os.environ.get("S3IP", "127.0.0.1"),
+    help="S3 ip address"
 )
 parser.add_option(
-    "--s3-port", "--s3port", dest="s3port", default=9001, help="S3 API port"
+    "--s3port",
+    "--s3-port",
+    dest="s3port",
+    default=os.environ.get("S3PORT", 9001),
+    help="S3 API port"
 )
 parser.add_option(
-    "--s3-bucket", "--s3bucket", dest="s3bucket", default="root", help="S3 bucker name"
+    "--s3bucket",
+    "--s3-bucket",
+    dest="s3bucket",
+    default=os.environ.get("S3BUCKET", "root"),
+    help="S3 bucker name"
 )
 parser.add_option(
     "--s3-access-key",
     "--s3accesskey",
     dest="s3accesskey",
-    default="127.0.0.1",
+    default=os.environ.get("S3ACCESSKEY", "127.0.0.1"),
     help="S3 access key",
 )
 parser.add_option(
     "--s3-secret-key",
     "--s3secretkey",
     dest="s3secretkey",
-    default="127.0.0.1",
+    default=os.environ.get("S3SECRETKEY", "127.0.0.1"),
     help="S3 secret key",
 )
 parser.add_option(
-    "--s3-secure", "--s3secure", dest="s3secure", default=False, help="S3 secure mode"
+    "--s3secure",
+    "--s3-secure",
+    dest="s3secure",
+    default=os.environ.get("S3SECURE", False),
+    help="S3 secure mode"
 )
 parser.add_option(
-    "--s3-ssl-cert-file",
     "--s3sslcertfile",
+    "--s3-ssl-cert-file",
     dest="s3sslcertfile",
-    default="",
+    default=os.environ.get("S3SSLCERTFILE", ""),
     help="SSL certificate for S3",
 )
 parser.add_option(
-    "--s3-disk-name",
     "--s3diskname",
+    "--s3-disk-name",
     dest="s3diskname",
-    default="s3",
+    default=os.environ.get("S3DISKNAME", "s3"),
     help="S3 disk name",
 )
 parser.add_option(
-    "--keep-data",
     "--keepdata",
+    "--keep-data",
     action="store_true",
     dest="keepdata",
-    default=False,
+    default=os.environ.get("KEEPDATA", False),
     help="keep auxiliary data in ClickHouse table",
 )
 parser.add_option(
-    "--collect-only",
     "--collectonly",
+    "--collect-only",
     action="store_true",
     dest="collectonly",
-    default=False,
+    default=os.environ.get("COLLECTONLY", False),
     help="put object names to auxiliary table",
 )
 parser.add_option(
-    "--use-collected",
     "--usecollected",
+    "--use-collected",
     action="store_true",
     dest="usecollected",
-    default=False,
+    default=os.environ.get("USECOLLECTED", False),
     help="auxiliary data is already collected in ClickHouse table",
 )
 parser.add_option(
-    "--collect-table-prefix",
     "--collecttableprefix",
+    "--collect-table-prefix",
     dest="collecttableprefix",
-    default="s3objects_for_",
+    default=os.environ.get("COLLECTTABLEPREFIX", "s3objects_for_"),
     help="prefix for table name to keep data about objects (tablespace is allowed)",
 )
 parser.add_option(
@@ -136,21 +157,23 @@ parser.add_option(
     "--batchsize",
     dest="batchsize",
     type = "int",
-    default=1024,
+    default=os.environ.get("BATCHSIZE", 1024),
     help="number of rows to insert to ClickHouse at once",
 )
 parser.add_option(
-    "--total-num",
     "--total",
+    "--total-num",
     dest="total",
     type = "int",
+    default=oeg("TOTAL"),
     help="number of objects to process. Cam be used in conjunction with start-after",
 )
 parser.add_option(
+    "--after",
     "--start-after",
     "--startafter",
-    "--after",
     dest="after",
+    default=os.environ.get("AFTER"),
     help="Object name to start after. If not specified, traversing objects from the beginning",
 )
 parser.add_option(
@@ -158,7 +181,7 @@ parser.add_option(
     "--cluster-name",
     "--clustername",
     dest="clustername",
-    default="",
+    default=os.environ.get("CLUSTERNAME", ""),
     help="consider an objects unused if there is no host in the cluster refers the object",
 )
 parser.add_option(
@@ -167,25 +190,54 @@ parser.add_option(
     "--age-hours",
     dest="age",
     type = "int",
-    default=0,
+    default=os.environ.get("AGE", 0),
     help="process only objects older than specified, it is assumed that timezone is UTC",
 )
-
 parser.add_option(
-    "--verbose", action="store_true", dest="verbose", default=False, help="debug output"
+    "--verbose",
+    action="store_true",
+    dest="verbose",
+    default=os.environ.get("VERBOSE", False),
+    help="debug output"
 )
 parser.add_option(
     "--debug",
     action="store_true",
     dest="debug",
-    default=False,
+    default=os.environ.get("DEBUG", False),
     help="trace output (more verbose)",
 )
 parser.add_option(
-    "--silent", action="store_true", dest="silent", default=False, help="no log"
+    "--silent",
+    action="store_true",
+    dest="silent",
+    default=os.environ.get("SILENT", False),
+    help="no log"
+)
+parser.add_option(
+    "--listoptions",
+    "--list-options",
+    action="store_true",
+    dest="listoptions",
+    default=False,
+    help="list all command line options for internal purposes"
 )
 
 (options, args) = parser.parse_args()
+
+if options.listoptions:
+    defaults, _ = parser.parse_args([])
+    vrs = vars(defaults)
+    print("ENV ", end='')
+    backslash = False
+    for key in vrs:
+        # print(f"{key} - {vrs[key]}")
+        if (key != 'listoptions'):
+            if backslash:
+                print(" \\ ")
+            print(f" {key.upper()}={vrs[key]}", end='')
+        backslash = True
+    exit()
 
 logging.getLogger().setLevel(logging.WARNING)
 if options.verbose:

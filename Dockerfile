@@ -23,14 +23,17 @@ ENV  CHHOST=localhost \
  COLLECTONLY=False \ 
  USECOLLECTED=False \ 
  COLLECTTABLEPREFIX=s3objects_for_ \ 
- BATCHSIZE=1024 \ 
+ COLLECTBATCHSIZE=1024 \ 
  TOTAL=None \ 
- AFTER=None \ 
+ COLLECTAFTER=None \ 
+ USEAFTER=None \ 
+ USETOTAL=None \ 
  CLUSTERNAME= \ 
  AGE=0 \ 
+ SAMPLES=4 \ 
  VERBOSE=False \ 
  DEBUG=False \ 
  SILENT=False
 
 ENTRYPOINT ["python", "./s3gc.py"]
-CMD ["--help" ]
+# CMD ["--help" ]

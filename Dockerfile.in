@@ -10,4 +10,4 @@ COPY . .
 # @@
 
 ENTRYPOINT ["python", "./s3gc.py"]
-CMD ["--help" ]
+# CMD ["--help" ]

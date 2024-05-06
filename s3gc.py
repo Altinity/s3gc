@@ -348,6 +348,20 @@ if not args.collectonly:
     if args.clustername:
         srdp = f"clusterAllReplicas({args.clustername}, {srdp})"
 
+    num_rows=0
+    try:
+        result = client.query(f"SELECT COUNT(1) FROM {tname}")
+    except Exception:
+        pass
+    if num_rows==0:
+        logging.info(
+            f"auxiliary table {tname} does not exist or empty, nothing to do"
+        )
+        if not args.silent:
+            print("s3gc: OK")
+
+        exit()
+
 
     num_removed = 0
     objs = []

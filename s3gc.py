@@ -20,11 +20,13 @@ from minio import Minio
 from minio.deleteobjects import DeleteObject
 from contextlib import redirect_stdout
 import clickhouse_connect
-# from optparse import OptionParser
 from jsonargparse import (
     ArgumentParser,
     ActionConfigFile,
 )
+
+from jsonargparse.typing import Optional
+
 
 import urllib3
 import logging
@@ -37,25 +39,18 @@ usage = """
 
 parser = ArgumentParser(usage=usage, env_prefix="S3GC", default_env=True, exit_on_error=False)
 
-
-
-
-def oeg(envname, default=None):
-    val=os.environ.get(envname, default)
-    return None if val=='None' else val
-
 parser.add_argument(
     "--chhost",
     "--ch-host",
     dest="chhost",
-    default=os.environ.get("CHHOST", "localhost"),
+    default="localhost",
     help="ClickHouse host to connect to",
 )
 parser.add_argument(
     "--chport",
     "--ch-port",
     dest="chport",
-    default=os.environ.get("CHPORT", 8123),
+    default=8123,
     help="ClickHouse port to connect to",
 )
 parser.add_argument(
@@ -63,7 +58,7 @@ parser.add_argument(
     "--ch-user-name",
     "--chusername",
     dest="chuser",
-    default=os.environ.get("CHUSER", "default"),
+    default="default",
     help="ClickHouse user name",
 )
 parser.add_argument(
@@ -71,63 +66,63 @@ parser.add_argument(
     "--ch-pass",
     "--ch-password",
     dest="chpass",
-    default=os.environ.get("CHPASS", ""),
+    default="",
     help="ClickHouse user password",
 )
 parser.add_argument(
     "--s3ip",
     "--s3-ip",
     dest="s3ip",
-    default=os.environ.get("S3IP", "127.0.0.1"),
+    default="127.0.0.1",
     help="S3 ip address"
 )
 parser.add_argument(
     "--s3port",
     "--s3-port",
     dest="s3port",
-    default=os.environ.get("S3PORT", 9001),
+    default=9001,
     help="S3 API port"
 )
 parser.add_argument(
     "--s3bucket",
     "--s3-bucket",
     dest="s3bucket",
-    default=os.environ.get("S3BUCKET", "root"),
+    default="root",
     help="S3 bucker name"
 )
 parser.add_argument(
     "--s3-access-key",
     "--s3accesskey",
     dest="s3accesskey",
-    default=os.environ.get("S3ACCESSKEY", "127.0.0.1"),
+    default="",
     help="S3 access key",
 )
 parser.add_argument(
     "--s3-secret-key",
     "--s3secretkey",
     dest="s3secretkey",
-    default=os.environ.get("S3SECRETKEY", "127.0.0.1"),
+    default="",
     help="S3 secret key",
 )
 parser.add_argument(
     "--s3secure",
     "--s3-secure",
     dest="s3secure",
-    default=os.environ.get("S3SECURE", False),
+    default=False,
     help="S3 secure mode"
 )
 parser.add_argument(
     "--s3sslcertfile",
     "--s3-ssl-cert-file",
     dest="s3sslcertfile",
-    default=os.environ.get("S3SSLCERTFILE", ""),
+    default="",
     help="SSL certificate for S3",
 )
 parser.add_argument(
     "--s3diskname",
     "--s3-disk-name",
     dest="s3diskname",
-    default=os.environ.get("S3DISKNAME", "s3"),
+    default="s3",
     help="S3 disk name",
 )
 parser.add_argument(
@@ -135,7 +130,7 @@ parser.add_argument(
     "--keep-data",
     action="store_true",
     dest="keepdata",
-    default=os.environ.get("KEEPDATA", False),
+    default=False,
     help="keep auxiliary data in ClickHouse table",
 )
 parser.add_argument(
@@ -143,7 +138,7 @@ parser.add_argument(
     "--collect-only",
     action="store_true",
     dest="collectonly",
-    default=os.environ.get("COLLECTONLY", False),
+    default=False,
     help="put object names to auxiliary table",
 )
 parser.add_argument(
@@ -151,14 +146,14 @@ parser.add_argument(
     "--use-collected",
     action="store_true",
     dest="usecollected",
-    default=os.environ.get("USECOLLECTED", False),
+    default=False,
     help="auxiliary data is already collected in ClickHouse table",
 )
 parser.add_argument(
     "--collecttableprefix",
     "--collect-table-prefix",
     dest="collecttableprefix",
-    default=os.environ.get("COLLECTTABLEPREFIX", "s3objects_for_"),
+    default="s3objects_for_",
     help="prefix for table name to keep data about objects (tablespace is allowed)",
 )
 parser.add_argument(
@@ -166,36 +161,32 @@ parser.add_argument(
     "--collect-batch-size",
     dest="collectbatchsize",
     type = int,
-    default=os.environ.get("COLLECTBATCHSIZE", 1024),
+    default=1024,
     help="number of rows to insert to ClickHouse at once",
 )
 parser.add_argument(
     "--total",
     "--total-num",
     dest="total",
-    type = int,
-    default=oeg("TOTAL"),
+    type = Optional[int],
     help="Number of objects to process. Can be used in conjunction with start-after",
 )
 parser.add_argument(
     "--collectafter",
     "--collect-after",
     dest="collectafter",
-    default=os.environ.get("COLLECTAFTER"),
     help="Object name to start after. If not specified, traversing objects from the beginning",
 )
 parser.add_argument(
     "--useafter",
     "--use-after",
     dest="useafter",
-    default=os.environ.get("USEAFTER"),
     help="Object name to start processing already collected objects after. If not specified, traversing objects from the beginning",
 )
 parser.add_argument(
     "--usetotal",
     "--use-total",
     dest="usetotal",
-    default=os.environ.get("USETOTAL"),
     help="Number of already collected objects to process. Can be used in conjunction with use-after",
 )
 parser.add_argument(
@@ -203,7 +194,7 @@ parser.add_argument(
     "--cluster-name",
     "--clustername",
     dest="clustername",
-    default=os.environ.get("CLUSTERNAME", ""),
+    default="",
     help="consider an objects unused if there is no host in the cluster refers the object",
 )
 parser.add_argument(
@@ -211,36 +202,36 @@ parser.add_argument(
     "--hours",
     "--age-hours",
     dest="age",
-    type = int,
-    default=os.environ.get("AGE", 0),
+    type=int,
+    default=0,
     help="process only objects older than specified, it is assumed that timezone is UTC",
 )
 parser.add_argument(
     "--samples",
     dest="samples",
-    type = int,
-    default=os.environ.get("SAMPLES", 4),
+    type=int,
+    default=4,
     help="process only objects older than specified, it is assumed that timezone is UTC",
 )
 parser.add_argument(
     "--verbose",
     action="store_true",
     dest="verbose",
-    default=os.environ.get("VERBOSE", False),
+    default=False,
     help="debug output"
 )
 parser.add_argument(
     "--debug",
     action="store_true",
     dest="debug",
-    default=os.environ.get("DEBUG", False),
+    default=False,
     help="trace output (more verbose)",
 )
 parser.add_argument(
     "--silent",
     action="store_true",
     dest="silent",
-    default=os.environ.get("SILENT", False),
+    default=False,
     help="no log"
 )
 parser.add_argument(
@@ -258,8 +249,6 @@ parser.add_argument("--cfg", action=ActionConfigFile)
 # out = get_parse_args_stdout(parser, ["--print_config"])
 # print(out)
 
-
-# (options, args) = parser.parse_args()
 args = parser.parse_args()
 
 if args.listoptions:
@@ -368,7 +357,7 @@ if not args.collectonly:
         SELECT s3o.objpath FROM {tname} AS s3o LEFT ANTI JOIN {srdp} AS rdp ON
         (rdp.remote_path = s3o.objpath AND rdp.disk_name='{args.s3diskname}')
         WHERE CRC32(s3o.objpath) % {args.samples} = {sample} AND s3o.active=true
-        ORDER BY s3o.objpath  SETTINGS final = 1;"""
+        ORDER BY s3o.objpath  SETTINGS final = 1"""
         logging.info(antijoin)
 
         with ch_client.query_row_block_stream(antijoin) as stream:

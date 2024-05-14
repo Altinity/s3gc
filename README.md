@@ -28,8 +28,9 @@ python3 s3gc.py --help
 ```
 ### typical usage
 #### all together
+for https://altinity-clickhouse-data-demo20565656565620663600000001.s3.amazonaws.com/github
 ```
-S3GC_S3PORT=19000  S3GC_S3ACCESSKEY=minio99  S3GC_S3SECRETKEY=minio123  python3 ./s3gc.py --verbose
+S3GC_S3PORT=19000  S3GC_S3ACCESSKEY=sdfasfaerasasf  S3GC_S3SECRETKEY=werqwsdfqwersdfasf  S3GC_S3IP=s3.amazonaws.com S3GC_S3PORT=443 S3GC_S3REGION=us-east-1 S3GC_S3BUCKET=altinity-clickhouse-data-demo20565656565620663600000001 S3GC_S3PATH=github/ S3GC_S3SECURE_FLAG=true python3 ./s3gc.py --verbose
 ```
 #### collect only
 ```

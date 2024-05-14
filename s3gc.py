@@ -93,6 +93,13 @@ parser.add_argument(
     help="S3 bucket name"
 )
 parser.add_argument(
+    "--s3path",
+    "--s3-path",
+    dest="s3path",
+    default="data/",
+    help="S3 path prefix"
+)
+parser.add_argument(
     "--s3-access-key",
     "--s3accesskey",
     dest="s3accesskey",
@@ -415,7 +422,7 @@ if not args.usecollected_flag:
         http_client=urllib3.PoolManager(cert_reqs="CERT_NONE"),
     )
 
-    objects = minio_client.list_objects(args.s3bucket, "data/", recursive=True, start_after=args.collectafter)
+    objects = minio_client.list_objects(args.s3bucket, args.s3path, recursive=True, start_after=args.collectafter)
 
     logger.info(f"creating {tname}")
     ch_client.command(

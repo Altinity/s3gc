@@ -16,6 +16,7 @@ It is possible to split these stages or do everything at one go.
 
 import os
 import sys
+import re
 from io import StringIO
 from minio import Minio
 from minio.deleteobjects import DeleteObject
@@ -75,7 +76,7 @@ parser.add_argument(
     "--s3-ip",
     dest="s3ip",
     default="127.0.0.1",
-    help="S3 ip address"
+    help="S3 API ip address or host"
 )
 parser.add_argument(
     "--s3port",
@@ -89,7 +90,7 @@ parser.add_argument(
     "--s3-bucket",
     dest="s3bucket",
     default="root",
-    help="S3 bucker name"
+    help="S3 bucket name"
 )
 parser.add_argument(
     "--s3-access-key",
@@ -127,6 +128,12 @@ parser.add_argument(
     dest="s3sslcertfile",
     default="",
     help="SSL certificate for S3",
+)
+parser.add_argument(
+    "--s3region",
+    "--s3-region",
+    dest="s3region",
+    help="S3 Region",
 )
 parser.add_argument(
     "--s3diskname",
@@ -188,7 +195,7 @@ parser.add_argument(
     "--collect-table-prefix",
     dest="collecttableprefix",
     default="s3objects_for_",
-    help="prefix for table name to keep data about objects (tablespace is allowed)",
+    help="prefix for table name to keep data about objects (database is allowed)",
 )
 parser.add_argument(
     "--collectbatchsize",
@@ -222,6 +229,12 @@ parser.add_argument(
     "--use-total",
     dest="usetotal",
     help="Number of already collected objects to process. Can be used in conjunction with use-after",
+)
+parser.add_argument(
+    "--dryrun",
+    "--dry-run",
+    dest="dryrun",
+    help="Calculate objects to remove without actual removing",
 )
 parser.add_argument(
     "--cluster",
@@ -310,7 +323,6 @@ parser.add_argument("--cfg", action=ActionConfigFile)
 args = parser.parse_args()
 
 if args.listoptions:
-
     with redirect_stdout(StringIO()) as f:
         try:
             parser.parse_args(["--print_config"])
@@ -334,12 +346,8 @@ if args.listoptions:
     print()
     exit()
 
-
-
-
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO) # set logger level
-# logger.setLevel(logging.WARNING)
+logger.setLevel(logging.WARNING) # set logger level
 if args.verbose_flag:
     print("verbose")
     logger.setLevel(logging.INFO)
@@ -351,14 +359,32 @@ if args.silent_flag:
     logger.setLevel(logging.CRITICAL)
 
 
-logFormatter = logging.Formatter\
-("%(asctime)s %(levelname)s %(message)s")
+class LogFormatter(logging.Formatter):
+    """Formatter that wipes passwords if they are longer than 3 characters."""
+
+    def get_filter_string():
+        chpass=args.chpass if len(args.chpass)>3 else ''
+        secretkey=args.s3secretkey if len(args.s3secretkey)>3 else ''
+        filter_delimiter='|' if len(chpass) and len(secretkey) else ''
+        filter_string = chpass + filter_delimiter + secretkey
+        return filter_string
+
+    filter_string=get_filter_string()
+
+    @staticmethod
+    def _filter(s):
+        return re.sub(rf"{LogFormatter.filter_string}", r'****', s)
+
+    def format(self, record):
+        original = logging.Formatter.format(self, record)
+        return self._filter(original) if len(self.filter_string) else original
+
+logFormatter=LogFormatter("%(asctime)s %(levelname)s %(message)s")
+
+
 consoleHandler = logging.StreamHandler(sys.stdout) #set streamhandler to stdout
 consoleHandler.setFormatter(logFormatter)
 logger.addHandler(consoleHandler)
-
-
-
 
 logger.info(
     f"Connecting to ClickHouse, host={args.chhost}, port={args.chport}, username={args.chuser}, password={args.chpass}"
@@ -378,13 +404,14 @@ tname = f"{args.collecttableprefix}{args.s3diskname}"
 
 if not args.usecollected_flag:
     logger.info(
-        f"Connecting to S3, host:port={args.s3ip}:{args.s3port}, access_key={args.s3accesskey}, secret_key={args.s3secretkey}, secure={args.s3secure_flag}"
+        f"Connecting to S3, host:port={args.s3ip}:{args.s3port}, access_key={args.s3accesskey}, secret_key={args.s3secretkey}, secure={args.s3secure_flag}, region={args.s3region}"
     )
     minio_client = Minio(
         f"{args.s3ip}:{args.s3port}",
         access_key=args.s3accesskey,
         secret_key=args.s3secretkey,
         secure=args.s3secure_flag,
+        region=args.s3region,
         http_client=urllib3.PoolManager(cert_reqs="CERT_NONE"),
     )
 
@@ -456,15 +483,16 @@ if not args.collectonly_flag:
                 for row in block:
                     logger.debug(f"removing {row[0]}")
                     objects_to_remove.append(DeleteObject(row[0]))
-                    objects_to_remove.append(DeleteObject(row[0] + 'ss'))
-                    errors = minio_client.remove_objects(args.s3bucket, objects_to_remove)
-                    for error in errors:
-                        logger.info(f"error occurred when deleting object {error}")
+                    if not args.dryrun:
+                        errors = minio_client.remove_objects(args.s3bucket, objects_to_remove)
+                        for error in errors:
+                            logger.info(f"error occurred when deleting object {error}")
 
                     num_removed += len(objects_to_remove)
                     objs.append([row[0], False])
 
-        ch_client.insert(tname, objs, column_names=["objpath", "active"])
+        if not args.dryrun:
+            ch_client.insert(tname, objs, column_names=["objpath", "active"])
 
 
     logger.info(f"{num_removed} objects are removed")

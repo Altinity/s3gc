@@ -16,6 +16,11 @@ There are two stages:
 
 It is possible to split these stages or do everything at one go.
 
+Besides this, it is possible to calculate objects to remove without actual removing AKA dry run.
+If dryrun is set together with usecollected, it uses collected data.
+If dryrun is set together with collectonly, error is raised.
+
+
 ## script invocation
 ### help
 ```

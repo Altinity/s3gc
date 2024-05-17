@@ -240,7 +240,17 @@ parser.add_argument(
 parser.add_argument(
     "--dryrun",
     "--dry-run",
-    dest="dryrun",
+    action="store_true",
+    dest="dryrun_flag",
+    help="Calculate objects to remove without actual removing",
+)
+parser.add_argument(
+    "--dryrunflag",
+    "--dryrun-flag",
+    "--dry-run-flag",
+    type=bool,
+    dest="dryrun_flag",
+    default=False,
     help="Calculate objects to remove without actual removing",
 )
 parser.add_argument(
@@ -409,7 +419,9 @@ if args.s3secure_flag:
 
 tname = f"{args.collecttableprefix}{args.s3diskname}"
 
-if not args.usecollected_flag:
+minio_client = None
+
+if not (args.usecollected_flag and args.dryrun_flag):
     logger.info(
         f"Connecting to S3, host:port={args.s3ip}:{args.s3port}, access_key={args.s3accesskey}, secret_key={args.s3secretkey}, secure={args.s3secure_flag}, region={args.s3region}"
     )
@@ -422,6 +434,7 @@ if not args.usecollected_flag:
         http_client=urllib3.PoolManager(cert_reqs="CERT_NONE"),
     )
 
+if not args.usecollected_flag:
     objects = minio_client.list_objects(args.s3bucket, args.s3path, recursive=True, start_after=args.collectafter)
 
     logger.info(f"creating {tname}")
@@ -430,6 +443,7 @@ if not args.usecollected_flag:
     )
     go_on = True
     rest_row_nums = args.total # None if not set
+    num_inserted = 0
     while go_on:
         objs = []
         for batch_element in range(0, args.collectbatchsize):
@@ -442,6 +456,8 @@ if not args.usecollected_flag:
             except StopIteration:
                 go_on = False
         ch_client.insert(tname, objs, column_names=["objpath", "active"])
+        logger.debug(f"{len(objs)} rows inserted in {tname}")
+        num_inserted += len(objs)
         if rest_row_nums is not None:
             rest_row_nums -= len(objs)
             if rest_row_nums == 0 or go_on == False:
@@ -452,6 +468,7 @@ if not args.usecollected_flag:
                     else:
                         print(f"s3gc: No object")
                 break
+    logger.info(f"{num_inserted} rows inserted in {tname} in total")
 
 if not args.collectonly_flag:
     srdp = "system.remote_data_paths"
@@ -460,8 +477,12 @@ if not args.collectonly_flag:
 
     num_rows=0
     try:
-        result = client.query(f"SELECT COUNT(1) FROM {tname}")
-    except Exception:
+        count_query = f"SELECT COUNT(1) FROM {tname}"
+        logger.debug(count_query)
+        result = ch_client.command(count_query)
+        num_rows = result
+    except Exception as exc:
+        logger.info(f"exception selecting from {tname}, {exc}")
         pass
     if num_rows==0:
         logger.info(
@@ -490,7 +511,7 @@ if not args.collectonly_flag:
                 for row in block:
                     logger.debug(f"removing {row[0]}")
                     objects_to_remove.append(DeleteObject(row[0]))
-                    if not args.dryrun:
+                    if not args.dryrun_flag:
                         errors = minio_client.remove_objects(args.s3bucket, objects_to_remove)
                         for error in errors:
                             logger.info(f"error occurred when deleting object {error}")
@@ -498,13 +519,13 @@ if not args.collectonly_flag:
                     num_removed += len(objects_to_remove)
                     objs.append([row[0], False])
 
-        if not args.dryrun:
+        if not args.dryrun_flag:
             ch_client.insert(tname, objs, column_names=["objpath", "active"])
 
 
     logger.info(f"{num_removed} objects are removed")
 
-    if not args.keepdata_flag:
+    if not args.keepdata_flag and not args.dryrun_flag:
         logger.info(f"truncating {tname}")
         ch_client.command(f"TRUNCATE TABLE {tname}")
 

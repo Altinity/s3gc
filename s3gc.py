@@ -140,6 +140,7 @@ parser.add_argument(
     "--s3region",
     "--s3-region",
     dest="s3region",
+    type=Optional[str],
     help="S3 Region",
 )
 parser.add_argument(
@@ -202,7 +203,14 @@ parser.add_argument(
     "--collect-table-prefix",
     dest="collecttableprefix",
     default="s3objects_for_",
-    help="prefix for table name to keep data about objects (database is allowed)",
+    help="prefix for table name to keep data about objects (database is allowed, must exist)",
+)
+parser.add_argument(
+    "--usefile",
+    "--use-file",
+    dest="usefile",
+    type=Optional[str],
+    help="use file, (not MergeTree) to keep data",
 )
 parser.add_argument(
     "--collectbatchsize",
@@ -216,25 +224,28 @@ parser.add_argument(
     "--total",
     "--total-num",
     dest="total",
-    type = Optional[int],
+    type=Optional[int],
     help="Number of objects to process. Can be used in conjunction with start-after",
 )
 parser.add_argument(
     "--collectafter",
     "--collect-after",
     dest="collectafter",
+    type=Optional[str],
     help="Object name to start after. If not specified, traversing objects from the beginning",
 )
 parser.add_argument(
     "--useafter",
     "--use-after",
     dest="useafter",
+    type=Optional[str],
     help="Object name to start processing already collected objects after. If not specified, traversing objects from the beginning",
 )
 parser.add_argument(
     "--usetotal",
     "--use-total",
     dest="usetotal",
+    type=Optional[int],
     help="Number of already collected objects to process. Can be used in conjunction with use-after",
 )
 parser.add_argument(
@@ -404,7 +415,7 @@ consoleHandler.setFormatter(logFormatter)
 logger.addHandler(consoleHandler)
 
 logger.info(
-    f"Connecting to ClickHouse, host={args.chhost}, port={args.chport}, username={args.chuser}, password={args.chpass}"
+    f"Connecting to ClickHouse, host={args.chhost}, port={args.chport}, username={args.chuser}, password={args.chpass}, s3path={args.s3path}, bucket={args.s3bucket}, s3path={args}"
 )
 ch_client = clickhouse_connect.get_client(
     host=args.chhost,
@@ -435,12 +446,18 @@ if not (args.usecollected_flag and args.dryrun_flag):
     )
 
 if not args.usecollected_flag:
+    logger.debug(f"start_after {args.collectafter}")
     objects = minio_client.list_objects(args.s3bucket, args.s3path, recursive=True, start_after=args.collectafter)
 
     logger.info(f"creating {tname}")
-    ch_client.command(
-        f"CREATE TABLE IF NOT EXISTS {tname} (objpath String, active Bool) ENGINE ReplacingMergeTree ORDER BY objpath PARTITION BY CRC32(objpath) % {args.samples}"
-    )
+    if args.usefile:
+        ch_client.command(
+            f"CREATE TABLE IF NOT EXISTS {tname} (objpath String) ENGINE File({args.usefile})"
+        )
+    else:
+        ch_client.command(
+            f"CREATE TABLE IF NOT EXISTS {tname} (objpath String, active Bool) ENGINE ReplacingMergeTree ORDER BY objpath PARTITION BY CRC32(objpath) % {args.samples}"
+        )
     go_on = True
     rest_row_nums = args.total # None if not set
     num_inserted = 0
@@ -496,13 +513,23 @@ if not args.collectonly_flag:
 
     num_removed = 0
     objs = []
-    for sample in range(0, args.samples):
+    num_samples = 1 if args.usefile else args.samples
+    for sample in range(0, num_samples):
 
-        antijoin = f"""
+        after_condition = f"AND s3o.objpath > {args.useafter} " if args.useafter else ""
+        limit = f" LIMIT {args.usetotal} "if args.usetotal else ""
+
+        mergeantijoin = f"""
         SELECT s3o.objpath FROM {tname} AS s3o LEFT ANTI JOIN {srdp} AS rdp ON
         (rdp.remote_path = s3o.objpath AND rdp.disk_name='{args.s3diskname}')
-        WHERE CRC32(s3o.objpath) % {args.samples} = {sample} AND s3o.active=true
-        ORDER BY s3o.objpath  SETTINGS final = 1"""
+        WHERE CRC32(s3o.objpath) % {args.samples} = {sample} AND s3o.active=true {after_condition}
+        ORDER BY s3o.objpath  {limit} SETTINGS final = 1"""
+        fileantijoin = f"""
+        SELECT s3o.objpath FROM {tname} AS s3o LEFT ANTI JOIN {srdp} AS rdp ON
+        (rdp.remote_path = s3o.objpath AND rdp.disk_name='{args.s3diskname}')
+        {after_condition}
+        ORDER BY s3o.objpath  {limit}"""
+        antijoin = fileantijoin if args.usefile else mergeantijoin
         logger.info(antijoin)
 
         with ch_client.query_row_block_stream(antijoin) as stream:
@@ -519,7 +546,7 @@ if not args.collectonly_flag:
                     num_removed += len(objects_to_remove)
                     objs.append([row[0], False])
 
-        if not args.dryrun_flag:
+        if not args.dryrun_flag and not args.usefile:
             ch_client.insert(tname, objs, column_names=["objpath", "active"])
 
 

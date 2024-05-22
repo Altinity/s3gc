@@ -203,14 +203,7 @@ parser.add_argument(
     "--collect-table-prefix",
     dest="collecttableprefix",
     default="s3objects_for_",
-    help="prefix for table name to keep data about objects (database is allowed, must exist)",
-)
-parser.add_argument(
-    "--usefile",
-    "--use-file",
-    dest="usefile",
-    type=Optional[str],
-    help="use file, (not MergeTree) to keep data",
+    help="prefix for table name to keep data about objects (database is allowed, if not exists, specify --create-database)",
 )
 parser.add_argument(
     "--collectbatchsize",
@@ -334,6 +327,38 @@ parser.add_argument(
     help="no log"
 )
 parser.add_argument(
+    "--create-database",
+    "--createdatabase",
+    action="store_true",
+    dest="create_database_flag",
+    default=False,
+    help="create database for collecttable"
+)
+parser.add_argument(
+    "--create-database-flag",
+    "--createdatabase-flag",
+    dest="create_database_flag",
+    type=bool,
+    default=False,
+    help="create database for collecttable"
+)
+parser.add_argument(
+    "--drop-collecttable",
+    "--dropcollecttable",
+    action="store_true",
+    dest="drop_collecttable_flag",
+    default=False,
+    help="drop collecttable and recreate; beware of ClickHouse DROP TABLE constraints"
+)
+parser.add_argument(
+    "--drop-collecttable-flag",
+    "--dropcollecttable-flag",
+    dest="drop_collecttable_flag",
+    type=bool,
+    default=False,
+    help="drop collecttable and recreate; beware of ClickHouse DROP TABLE constraints"
+)
+parser.add_argument(
     "--listoptions",
     "--list-options",
     action="store_true",
@@ -377,35 +402,36 @@ if args.listoptions:
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING) # set logger level
 if args.verbose_flag:
-    print("verbose")
     logger.setLevel(logging.INFO)
 if args.debug_flag:
-    print("debug")
     logger.setLevel(logging.DEBUG)
 if args.silent_flag:
-    print("silent")
     logger.setLevel(logging.CRITICAL)
 
 
 class LogFormatter(logging.Formatter):
     """Formatter that wipes passwords if they are longer than 3 characters."""
 
-    def get_filter_string():
-        chpass=args.chpass if len(args.chpass)>3 else ''
-        secretkey=args.s3secretkey if len(args.s3secretkey)>3 else ''
-        filter_delimiter='|' if len(chpass) and len(secretkey) else ''
-        filter_string = chpass + filter_delimiter + secretkey
-        return filter_string
+    def get_filter_strings():
+        filter_strings=[]
+        if len(args.chpass)>3:
+            filter_strings.append(args.chpass)
+        if len(args.s3secretkey)>3:
+            filter_strings.append(args.s3secretkey)
+        return filter_strings
 
-    filter_string=get_filter_string()
+    filter_strings=get_filter_strings()
 
     @staticmethod
     def _filter(s):
-        return re.sub(rf"{LogFormatter.filter_string}", r'****', s)
+        for fs in LogFormatter.filter_strings:
+            s=s.replace(fs, '****')
+
+        return s
 
     def format(self, record):
         original = logging.Formatter.format(self, record)
-        return self._filter(original) if len(self.filter_string) else original
+        return self._filter(original) if len(self.filter_strings) else original
 
 logFormatter=LogFormatter("%(asctime)s %(levelname)s %(message)s")
 
@@ -414,8 +440,13 @@ consoleHandler = logging.StreamHandler(sys.stdout) #set streamhandler to stdout
 consoleHandler.setFormatter(logFormatter)
 logger.addHandler(consoleHandler)
 
+logger.debug(
+    f"Parameters: {args}"
+)
+
+
 logger.info(
-    f"Connecting to ClickHouse, host={args.chhost}, port={args.chport}, username={args.chuser}, password={args.chpass}, s3path={args.s3path}, bucket={args.s3bucket}, s3path={args}"
+    f"Connecting to ClickHouse, host={args.chhost}, port={args.chport}, username={args.chuser}, password={args.chpass}, s3path={args.s3path}, bucket={args.s3bucket}, s3path={args.s3path}"
 )
 ch_client = clickhouse_connect.get_client(
     host=args.chhost,
@@ -449,18 +480,32 @@ if not args.usecollected_flag:
     logger.debug(f"start_after {args.collectafter}")
     objects = minio_client.list_objects(args.s3bucket, args.s3path, recursive=True, start_after=args.collectafter)
 
-    logger.info(f"creating {tname}")
-    if args.usefile:
+    if args.create_database_flag:
+        parts=args.collecttableprefix.split('.')
+        if len(parts)>1:
+            logger.info(f"creating database {parts[0]}")
+            ch_client.command(
+                f"CREATE DATABASE IF NOT EXISTS {parts[0]}"
+            )
+            logger.debug(f"database created")
+
+    if args.drop_collecttable_flag:
+        logger.info(f"dropping table {tname}")
         ch_client.command(
-            f"CREATE TABLE IF NOT EXISTS {tname} (objpath String) ENGINE File({args.usefile})"
+            f"DROP TABLE IF EXISTS {tname}"
         )
-    else:
-        ch_client.command(
-            f"CREATE TABLE IF NOT EXISTS {tname} (objpath String, active Bool) ENGINE ReplacingMergeTree ORDER BY objpath PARTITION BY CRC32(objpath) % {args.samples}"
-        )
+        logger.debug(f"table dropped")
+
+            
+    logger.info(f"creating table {tname}")
+    ch_client.command(
+        f"CREATE TABLE IF NOT EXISTS {tname} (objpath String, size Int64, active Bool) ENGINE ReplacingMergeTree ORDER BY objpath PARTITION BY CRC32(objpath) % {args.samples}"
+    )
+    logger.debug(f"table created")
     go_on = True
     rest_row_nums = args.total # None if not set
     num_inserted = 0
+    total_size = 0
     while go_on:
         objs = []
         for batch_element in range(0, args.collectbatchsize):
@@ -469,10 +514,11 @@ if not args.usecollected_flag:
                 delta = datetime.datetime.now(datetime.timezone.utc) - obj.last_modified
                 hours = (int(delta.seconds / 3600))
                 if hours >= args.age:
-                    objs.append([obj.object_name, True])
+                    objs.append([obj.object_name, obj.size, True])
+                    total_size += obj.size
             except StopIteration:
                 go_on = False
-        ch_client.insert(tname, objs, column_names=["objpath", "active"])
+        ch_client.insert(tname, objs, column_names=["objpath", "size", "active"])
         logger.debug(f"{len(objs)} rows inserted in {tname}")
         num_inserted += len(objs)
         if rest_row_nums is not None:
@@ -485,7 +531,7 @@ if not args.usecollected_flag:
                     else:
                         print(f"s3gc: No object")
                 break
-    logger.info(f"{num_inserted} rows inserted in {tname} in total")
+    logger.info(f"information about {num_inserted} objects of total size {total_size} is inserted in {tname}")
 
 if not args.collectonly_flag:
     srdp = "system.remote_data_paths"
@@ -512,45 +558,40 @@ if not args.collectonly_flag:
 
 
     num_removed = 0
+    total_size = 0
     objs = []
-    num_samples = 1 if args.usefile else args.samples
-    for sample in range(0, num_samples):
+    for sample in range(0, args.samples):
 
         after_condition = f"AND s3o.objpath > {args.useafter} " if args.useafter else ""
         limit = f" LIMIT {args.usetotal} "if args.usetotal else ""
 
-        mergeantijoin = f"""
-        SELECT s3o.objpath FROM {tname} AS s3o LEFT ANTI JOIN {srdp} AS rdp ON
+        antijoin = f"""
+        SELECT s3o.objpath, s3o.size FROM {tname} AS s3o LEFT ANTI JOIN {srdp} AS rdp ON
         (rdp.remote_path = s3o.objpath AND rdp.disk_name='{args.s3diskname}')
         WHERE CRC32(s3o.objpath) % {args.samples} = {sample} AND s3o.active=true {after_condition}
         ORDER BY s3o.objpath  {limit} SETTINGS final = 1"""
-        fileantijoin = f"""
-        SELECT s3o.objpath FROM {tname} AS s3o LEFT ANTI JOIN {srdp} AS rdp ON
-        (rdp.remote_path = s3o.objpath AND rdp.disk_name='{args.s3diskname}')
-        {after_condition}
-        ORDER BY s3o.objpath  {limit}"""
-        antijoin = fileantijoin if args.usefile else mergeantijoin
         logger.info(antijoin)
 
         with ch_client.query_row_block_stream(antijoin) as stream:
             for block in stream:
                 objects_to_remove=[]
                 for row in block:
-                    logger.debug(f"removing {row[0]}")
+                    logger.debug(f"{'removing' if not args.dryrun_flag else 'would remove if no dryrun flag'}  {row[0]} of size {row[1]}")
                     objects_to_remove.append(DeleteObject(row[0]))
-                    if not args.dryrun_flag:
-                        errors = minio_client.remove_objects(args.s3bucket, objects_to_remove)
-                        for error in errors:
-                            logger.info(f"error occurred when deleting object {error}")
+                    objs.append([row[0], row[1], False])
+                    total_size+=row[1]
+                if not args.dryrun_flag:
+                    errors = minio_client.remove_objects(args.s3bucket, objects_to_remove)
+                    for error in errors:
+                        logger.info(f"error occurred when deleting object {error}")
 
-                    num_removed += len(objects_to_remove)
-                    objs.append([row[0], False])
+                num_removed += len(objects_to_remove)
 
-        if not args.dryrun_flag and not args.usefile:
-            ch_client.insert(tname, objs, column_names=["objpath", "active"])
+        if not args.dryrun_flag:
+            ch_client.insert(tname, objs, column_names=["objpath", "size", "active"])
 
 
-    logger.info(f"{num_removed} objects are removed")
+    logger.info(f"{num_removed} objects of total size {total_size} {'are removed' if not args.dryrun_flag else 'would be removed but for dryrun flag'}")
 
     if not args.keepdata_flag and not args.dryrun_flag:
         logger.info(f"truncating {tname}")

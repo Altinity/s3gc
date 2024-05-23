@@ -16,23 +16,22 @@ It is possible to split these stages or do everything at one go.
 
 import os
 import sys
-import re
 from io import StringIO
 from minio import Minio
 from minio.deleteobjects import DeleteObject
 from contextlib import redirect_stdout
 import clickhouse_connect
+
 from jsonargparse import (
     ArgumentParser,
     ActionConfigFile,
 )
-
 from jsonargparse.typing import Optional
-
 
 import urllib3
 import logging
 import datetime
+from distutils.util import strtobool
 
 usage = """
     s3 garbage collector for ClickHouse
@@ -282,6 +281,64 @@ parser.add_argument(
     help="process only objects older than specified, it is assumed that timezone is UTC",
 )
 parser.add_argument(
+    "--chtimeout",
+    "--ch-timeout",
+    "--send-receive-timeout",
+    "--ch-send-receive-timeout",
+    dest="chtimeout",
+    type=int,
+    default=1800,
+    help="clickhouse send/receive timeout in seconds",
+)
+parser.add_argument(
+    "--create-database",
+    "--createdatabase",
+    action="store_true",
+    dest="createdatabase_flag",
+    default=False,
+    help="create database for collecttable"
+)
+parser.add_argument(
+    "--create-database-flag",
+    "--createdatabase-flag",
+    dest="createdatabase_flag",
+    type=bool,
+    default=False,
+    help="create database for collecttable"
+)
+parser.add_argument(
+    "--drop-collecttable",
+    "--dropcollecttable",
+    action="store_true",
+    dest="drop_collecttable_flag",
+    default=False,
+    help="drop collecttable and recreate; beware of ClickHouse DROP TABLE constraints"
+)
+parser.add_argument(
+    "--drop-collecttable-flag",
+    "--dropcollecttable-flag",
+    dest="drop_collecttable_flag",
+    type=bool,
+    default=False,
+    help="drop collecttable and recreate; beware of ClickHouse DROP TABLE constraints"
+)
+parser.add_argument(
+    "--non-interactive",
+    "--noninteractive",
+    action="store_false",
+    dest="interactive_flag",
+    default=False,
+    help="confirm deleting"
+)
+parser.add_argument(
+    "--non-interactive-flag",
+    "--noninteractive-flag",
+    dest="interactive_flag",
+    type=bool,
+    default=True,
+    help="confirm deleting"
+)
+parser.add_argument(
     "--verbose",
     action="store_true",
     dest="verbose_flag",
@@ -325,38 +382,6 @@ parser.add_argument(
     type=bool,
     default=False,
     help="no log"
-)
-parser.add_argument(
-    "--create-database",
-    "--createdatabase",
-    action="store_true",
-    dest="create_database_flag",
-    default=False,
-    help="create database for collecttable"
-)
-parser.add_argument(
-    "--create-database-flag",
-    "--createdatabase-flag",
-    dest="create_database_flag",
-    type=bool,
-    default=False,
-    help="create database for collecttable"
-)
-parser.add_argument(
-    "--drop-collecttable",
-    "--dropcollecttable",
-    action="store_true",
-    dest="drop_collecttable_flag",
-    default=False,
-    help="drop collecttable and recreate; beware of ClickHouse DROP TABLE constraints"
-)
-parser.add_argument(
-    "--drop-collecttable-flag",
-    "--dropcollecttable-flag",
-    dest="drop_collecttable_flag",
-    type=bool,
-    default=False,
-    help="drop collecttable and recreate; beware of ClickHouse DROP TABLE constraints"
 )
 parser.add_argument(
     "--listoptions",
@@ -453,6 +478,7 @@ ch_client = clickhouse_connect.get_client(
     port=args.chport,
     username=args.chuser,
     password=args.chpass,
+    send_receive_timeout=args.chtimeout
 )
 
 if args.s3secure_flag:
@@ -480,7 +506,7 @@ if not args.usecollected_flag:
     logger.debug(f"start_after {args.collectafter}")
     objects = minio_client.list_objects(args.s3bucket, args.s3path, recursive=True, start_after=args.collectafter)
 
-    if args.create_database_flag:
+    if args.createdatabase_flag:
         parts=args.collecttableprefix.split('.')
         if len(parts)>1:
             logger.info(f"creating database {parts[0]}")
@@ -496,7 +522,7 @@ if not args.usecollected_flag:
         )
         logger.debug(f"table dropped")
 
-            
+
     logger.info(f"creating table {tname}")
     ch_client.command(
         f"CREATE TABLE IF NOT EXISTS {tname} (objpath String, size Int64, active Bool) ENGINE ReplacingMergeTree ORDER BY objpath PARTITION BY CRC32(objpath) % {args.samples}"
@@ -565,12 +591,32 @@ if not args.collectonly_flag:
         after_condition = f"AND s3o.objpath > {args.useafter} " if args.useafter else ""
         limit = f" LIMIT {args.usetotal} "if args.usetotal else ""
 
+
+
         antijoin = f"""
-        SELECT s3o.objpath, s3o.size FROM {tname} AS s3o LEFT ANTI JOIN {srdp} AS rdp ON
+        SELECT s3o.objpath, s3o.size as size FROM {tname} AS s3o LEFT ANTI JOIN {srdp} AS rdp ON
         (rdp.remote_path = s3o.objpath AND rdp.disk_name='{args.s3diskname}')
         WHERE CRC32(s3o.objpath) % {args.samples} = {sample} AND s3o.active=true {after_condition}
         ORDER BY s3o.objpath  {limit} SETTINGS final = 1"""
         logger.info(antijoin)
+
+        if args.interactive_flag and not args.dryrun_flag and os.isatty(sys.stdout.fileno()) and os.isatty(sys.stdin.fileno()):
+            countjoin = f"SELECT COUNT(1), SUM(size) FROM ({antijoin}) q"
+            logger.debug(f"count join  {countjoin}")
+            result = ch_client.query(countjoin)
+            logger.debug(result.result_rows)
+            num_rows, total_size = result.result_rows[0]
+            while True:
+                answer = input(f"Proceed with removing {num_rows} objects of total size {total_size}? (Enter y/n)")
+                try:
+                    if not strtobool(answer):
+                        if not args.silent_flag:
+                            print("s3gc: OK")
+                        exit()
+                    break
+                except ValueError:
+                    pass
+
 
         with ch_client.query_row_block_stream(antijoin) as stream:
             for block in stream:

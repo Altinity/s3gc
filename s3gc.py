@@ -609,6 +609,9 @@ if not args.collectonly_flag:
         num_rows, total_size = result.result_rows[0]
         if num_rows==0:
             if not args.silent_flag:
+                logger.info(
+                    f"nothing to do"
+                )
                 print("s3gc: OK")
             exit()
 

@@ -327,12 +327,11 @@ parser.add_argument(
     "--noninteractive",
     action="store_false",
     dest="interactive_flag",
-    default=False,
+    default=True,
     help="confirm deleting"
 )
 parser.add_argument(
-    "--non-interactive-flag",
-    "--noninteractive-flag",
+    "--interactive-flag",
     dest="interactive_flag",
     type=bool,
     default=True,
@@ -469,7 +468,6 @@ logger.debug(
     f"Parameters: {args}"
 )
 
-
 logger.info(
     f"Connecting to ClickHouse, host={args.chhost}, port={args.chport}, username={args.chuser}, password={args.chpass}, s3path={args.s3path}, bucket={args.s3bucket}, s3path={args.s3path}"
 )
@@ -485,7 +483,7 @@ if args.s3secure_flag:
     logger.debug(f"using SSL certificate {args.s3sslcertfile}")
     os.environ["SSL_CERT_FILE"] = args.s3sslcertfile
 
-tname = f"{args.collecttableprefix}{args.s3diskname}"
+tname = f"`{args.collecttableprefix}{args.s3diskname}`"
 
 minio_client = None
 
@@ -511,7 +509,7 @@ if not args.usecollected_flag:
         if len(parts)>1:
             logger.info(f"creating database {parts[0]}")
             ch_client.command(
-                f"CREATE DATABASE IF NOT EXISTS {parts[0]}"
+                f"CREATE DATABASE IF NOT EXISTS `{parts[0]}`"
             )
             logger.debug(f"database created")
 
@@ -562,7 +560,7 @@ if not args.usecollected_flag:
 if not args.collectonly_flag:
     srdp = "system.remote_data_paths"
     if args.clustername:
-        srdp = f"clusterAllReplicas({args.clustername}, {srdp})"
+        srdp = f"clusterAllReplicas('{args.clustername}', {srdp})"
 
     num_rows=0
     try:
@@ -582,41 +580,56 @@ if not args.collectonly_flag:
 
         exit()
 
-
-    num_removed = 0
-    total_size = 0
-    objs = []
-    for sample in range(0, args.samples):
-
+    def make_antijoin(calc_only=False, sample=None):
         after_condition = f"AND s3o.objpath > {args.useafter} " if args.useafter else ""
         limit = f" LIMIT {args.usetotal} "if args.usetotal else ""
 
-
+        sample_condition = ' '
+        if not calc_only:
+            sample_condition = f"CRC32(s3o.objpath) % {args.samples} = {sample} AND "
 
         antijoin = f"""
         SELECT s3o.objpath, s3o.size as size FROM {tname} AS s3o LEFT ANTI JOIN {srdp} AS rdp ON
         (rdp.remote_path = s3o.objpath AND rdp.disk_name='{args.s3diskname}')
-        WHERE CRC32(s3o.objpath) % {args.samples} = {sample} AND s3o.active=true {after_condition}
-        ORDER BY s3o.objpath  {limit} SETTINGS final = 1"""
-        logger.info(antijoin)
+        WHERE {sample_condition} s3o.active=true {after_condition}
+        ORDER BY s3o.objpath {limit} SETTINGS final = 1"""
 
-        if args.interactive_flag and not args.dryrun_flag and os.isatty(sys.stdout.fileno()) and os.isatty(sys.stdin.fileno()):
-            countjoin = f"SELECT COUNT(1), SUM(size) FROM ({antijoin}) q"
-            logger.debug(f"count join  {countjoin}")
-            result = ch_client.query(countjoin)
-            logger.debug(result.result_rows)
-            num_rows, total_size = result.result_rows[0]
-            while True:
-                answer = input(f"Proceed with removing {num_rows} objects of total size {total_size}? (Enter y/n)")
-                try:
-                    if not strtobool(answer):
-                        if not args.silent_flag:
-                            print("s3gc: OK")
-                        exit()
-                    break
-                except ValueError:
-                    pass
+        if calc_only:
+            countantijoin = f"SELECT COUNT(1), SUM(size) FROM ({antijoin}) q"
+            return countantijoin
+        else:
+            return antijoin
 
+
+    if args.interactive_flag and not args.dryrun_flag and os.isatty(sys.stdout.fileno()) and os.isatty(sys.stdin.fileno()):
+        countantijoin = make_antijoin(calc_only=True)
+        logger.debug(f"count antijoin {countantijoin}")
+        result = ch_client.query(countantijoin)
+        logger.debug(result.result_rows)
+        num_rows, total_size = result.result_rows[0]
+        if num_rows==0:
+            if not args.silent_flag:
+                print("s3gc: OK")
+            exit()
+
+        while True:
+            answer = input(f"Proceed with removing {num_rows} objects of total size {total_size}? (Enter y/n) ")
+            try:
+                if not strtobool(answer):
+                    if not args.silent_flag:
+                        print("s3gc: OK")
+                    exit()
+                break
+            except ValueError:
+                pass
+
+    num_removed = 0
+    total_size = 0
+    objs = []
+
+    for sample in range(0, args.samples):
+        antijoin = make_antijoin(sample=sample)
+        logger.info(f"antijoin {antijoin}")
 
         with ch_client.query_row_block_stream(antijoin) as stream:
             for block in stream:

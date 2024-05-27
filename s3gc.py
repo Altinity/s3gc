@@ -432,7 +432,7 @@ if args.debug_flag:
 if args.silent_flag:
     logger.setLevel(logging.CRITICAL)
 
-
+##############################################################
 class LogFormatter(logging.Formatter):
     """Formatter that wipes passwords if they are longer than 3 characters."""
 
@@ -459,6 +459,13 @@ class LogFormatter(logging.Formatter):
 
 logFormatter=LogFormatter("%(asctime)s %(levelname)s %(message)s")
 
+def graceful_exit():
+    if not args.silent_flag:
+        print("s3gc: OK")
+    exit()
+
+##############################################################
+
 
 consoleHandler = logging.StreamHandler(sys.stdout) #set streamhandler to stdout
 consoleHandler.setFormatter(logFormatter)
@@ -468,29 +475,43 @@ logger.debug(
     f"Parameters: {args}"
 )
 
-logger.info(
-    f"Connecting to ClickHouse, host={args.chhost}, port={args.chport}, username={args.chuser}, password={args.chpass}, s3path={args.s3path}, bucket={args.s3bucket}, s3path={args.s3path}"
-)
-ch_client = clickhouse_connect.get_client(
-    host=args.chhost,
-    port=args.chport,
-    username=args.chuser,
-    password=args.chpass,
-    send_receive_timeout=args.chtimeout
-)
+tname=""
+dbname=None
 
-if args.s3secure_flag:
-    logger.debug(f"using SSL certificate {args.s3sslcertfile}")
-    os.environ["SSL_CERT_FILE"] = args.s3sslcertfile
-
-tname = f"`{args.collecttableprefix}{args.s3diskname}`"
+dbparts=args.collecttableprefix.split('.')
+if len(dbparts)>2:
+    raise ValueError("invalid collecttableprefix")
+elif len(dbparts)==2:
+    dbname=f"`{dbparts[0]}`"
+    tname = f"{dbname}.`{dbparts[1]}{args.s3diskname}`"
+else:
+    tname = f"`{dbparts[0]}{args.s3diskname}`"
 
 minio_client = None
+ch_client = None
 
-if not (args.usecollected_flag and args.dryrun_flag):
+def connect_to_ch():
+    logger.info(
+        f"Connecting to ClickHouse, host={args.chhost}, port={args.chport}, username={args.chuser}, password={args.chpass}, s3path={args.s3path}, bucket={args.s3bucket}, s3path={args.s3path}"
+    )
+    global ch_client
+    ch_client = clickhouse_connect.get_client(
+        host=args.chhost,
+        port=args.chport,
+        username=args.chuser,
+        password=args.chpass,
+        send_receive_timeout=args.chtimeout
+    )
+
+def connect_to_s3():
+    if args.s3secure_flag:
+        logger.debug(f"using SSL certificate {args.s3sslcertfile}")
+        os.environ["SSL_CERT_FILE"] = args.s3sslcertfile
+
     logger.info(
         f"Connecting to S3, host:port={args.s3ip}:{args.s3port}, access_key={args.s3accesskey}, secret_key={args.s3secretkey}, secure={args.s3secure_flag}, region={args.s3region}"
     )
+    global minio_client
     minio_client = Minio(
         f"{args.s3ip}:{args.s3port}",
         access_key=args.s3accesskey,
@@ -500,18 +521,20 @@ if not (args.usecollected_flag and args.dryrun_flag):
         http_client=urllib3.PoolManager(cert_reqs="CERT_NONE"),
     )
 
-if not args.usecollected_flag:
+def do_collect():
     logger.debug(f"start_after {args.collectafter}")
     objects = minio_client.list_objects(args.s3bucket, args.s3path, recursive=True, start_after=args.collectafter)
 
     if args.createdatabase_flag:
         parts=args.collecttableprefix.split('.')
-        if len(parts)>1:
-            logger.info(f"creating database {parts[0]}")
+        if dbname:
+            logger.info(f"creating database {dbname}")
             ch_client.command(
-                f"CREATE DATABASE IF NOT EXISTS `{parts[0]}`"
+                f"CREATE DATABASE IF NOT EXISTS {dbname}"
             )
             logger.debug(f"database created")
+        else:
+            raise ValueError("database must be a part of collecttableprefix if createdatabase flag is set")
 
     if args.drop_collecttable_flag:
         logger.info(f"dropping table {tname}")
@@ -557,7 +580,7 @@ if not args.usecollected_flag:
                 break
     logger.info(f"information about {num_inserted} objects of total size {total_size} is inserted in {tname}")
 
-if not args.collectonly_flag:
+def do_use():
     srdp = "system.remote_data_paths"
     if args.clustername:
         srdp = f"clusterAllReplicas('{args.clustername}', {srdp})"
@@ -575,10 +598,8 @@ if not args.collectonly_flag:
         logger.info(
             f"auxiliary table {tname} does not exist or empty, nothing to do"
         )
-        if not args.silent_flag:
-            print("s3gc: OK")
 
-        exit()
+        graceful_exit()
 
     def make_antijoin(calc_only=False, sample=None):
         after_condition = f"AND s3o.objpath > {args.useafter} " if args.useafter else ""
@@ -608,20 +629,14 @@ if not args.collectonly_flag:
         logger.debug(result.result_rows)
         num_rows, total_size = result.result_rows[0]
         if num_rows==0:
-            if not args.silent_flag:
-                logger.info(
-                    f"nothing to do"
-                )
-                print("s3gc: OK")
-            exit()
+            logger.info("Nothing to do")
+            graceful_exit()
 
         while True:
             answer = input(f"Proceed with removing {num_rows} objects of total size {total_size}? (Enter y/n) ")
             try:
                 if not strtobool(answer):
-                    if not args.silent_flag:
-                        print("s3gc: OK")
-                    exit()
+                    graceful_exit()
                 break
             except ValueError:
                 pass
@@ -659,5 +674,20 @@ if not args.collectonly_flag:
         logger.info(f"truncating {tname}")
         ch_client.command(f"TRUNCATE TABLE {tname}")
 
-if not args.silent_flag:
-    print("s3gc: OK")
+
+def main():
+
+    connect_to_ch()
+    if not (args.usecollected_flag and args.dryrun_flag):
+        connect_to_s3()
+    if not args.usecollected_flag:
+        do_collect()
+    if not args.collectonly_flag:
+        do_use()
+
+    graceful_exit()
+
+
+
+if __name__ == "__main__":
+    main()

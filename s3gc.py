@@ -204,10 +204,12 @@ parser.add_argument(
 )
 parser.add_argument(
     "--total",
+    "--collecttotal",
+    "--collect-total",
     "--total-num",
     dest="total",
     type=Optional[int],
-    help="Number of objects to process. Can be used in conjunction with start-after",
+    help="Number of objects to collect. Can be used in conjunction with start-after",
 )
 parser.add_argument(
     "--collectafter",
@@ -252,23 +254,35 @@ parser.add_argument(
     "--clustername",
     dest="clustername",
     default="",
-    help="consider an objects unused if there is no host in the cluster refers the object",
+    help="Consider an objects unused if there is no host in the cluster refers the object",
 )
 parser.add_argument(
     "--age",
     "--hours",
     "--age-hours",
+    "--collectage",
+    "--collecthours",
+    "--age-hours",
     dest="age",
     type=int,
     default=0,
-    help="process only objects older than specified, it is assumed that timezone is UTC",
+    help="Process only objects older than specified number of hours",
+)
+parser.add_argument(
+    "--useage",
+    "--usehours",
+    "--useage-hours",
+    dest="useage",
+    type=int,
+    default=0,
+    help="Process only already collected objects older than specified number of hours",
 )
 parser.add_argument(
     "--samples",
     dest="samples",
     type=int,
     default=4,
-    help="process only objects older than specified, it is assumed that timezone is UTC",
+    help="Number of partitions in auxiliary table",
 )
 parser.add_argument(
     "--chtimeout",
@@ -535,7 +549,7 @@ def do_collect():
 
     logger.info(f"creating table {tname}")
     ch_client.command(
-        f"CREATE TABLE IF NOT EXISTS {tname} (objpath String, size Int64, active Bool) ENGINE ReplacingMergeTree ORDER BY objpath PARTITION BY CRC32(objpath) % {args.samples}"
+        f"CREATE TABLE IF NOT EXISTS {tname} (objpath String, size Int64, last_modified DateTime, active Bool) ENGINE ReplacingMergeTree ORDER BY objpath PARTITION BY CRC32(objpath) % {args.samples}"
     )
     logger.debug(f"table created")
     go_on = True
@@ -550,11 +564,11 @@ def do_collect():
                 delta = datetime.datetime.now(datetime.timezone.utc) - obj.last_modified
                 hours = int(delta.seconds / 3600)
                 if hours >= args.age:
-                    objs.append([obj.object_name, obj.size, True])
+                    objs.append([obj.object_name, obj.size, obj.last_modified, True])
                     total_size += obj.size
             except StopIteration:
                 go_on = False
-        ch_client.insert(tname, objs, column_names=["objpath", "size", "active"])
+        ch_client.insert(tname, objs, column_names=["objpath", "size", "last_modified", "active"])
         logger.debug(f"{len(objs)} rows inserted in {tname}")
         num_inserted += len(objs)
         if rest_row_nums is not None:
@@ -593,6 +607,7 @@ def do_use():
 
     def make_antijoin(calc_only=False, sample=None):
         after_condition = f"AND s3o.objpath > {args.useafter} " if args.useafter else ""
+        age_condition = f"AND s3o.last_modified < now() - interval {args.useage} hour " if args.useage else ""
         limit = f" LIMIT {args.usetotal} " if args.usetotal else ""
 
         sample_condition = " "
@@ -600,9 +615,9 @@ def do_use():
             sample_condition = f"CRC32(s3o.objpath) % {args.samples} = {sample} AND "
 
         antijoin = f"""
-        SELECT s3o.objpath, s3o.size as size FROM {tname} AS s3o LEFT ANTI JOIN {srdp} AS rdp ON
+        SELECT s3o.objpath, s3o.size as size, s3o.last_modified as last_modified FROM {tname} AS s3o LEFT ANTI JOIN {srdp} AS rdp ON
         (rdp.remote_path = s3o.objpath AND rdp.disk_name='{args.s3diskname}')
-        WHERE {sample_condition} s3o.active=true {after_condition}
+        WHERE {sample_condition} s3o.active=true {after_condition} {age_condition}
         ORDER BY s3o.objpath {limit} SETTINGS final = 1"""
 
         if calc_only:
@@ -653,7 +668,7 @@ def do_use():
                         f"{'removing' if not args.dryrun_flag else 'would remove if no dryrun flag'}  {row[0]} of size {row[1]}"
                     )
                     objects_to_remove.append(DeleteObject(row[0]))
-                    objs.append([row[0], row[1], False])
+                    objs.append([row[0], row[1], row[2], False])
                     total_size += row[1]
                 if not args.dryrun_flag:
                     errors = minio_client.remove_objects(
@@ -665,7 +680,7 @@ def do_use():
                 num_removed += len(objects_to_remove)
 
         if not args.dryrun_flag:
-            ch_client.insert(tname, objs, column_names=["objpath", "size", "active"])
+            ch_client.insert(tname, objs, column_names=["objpath", "size", "last_modified", "active"])
 
     logger.info(
         f"{num_removed} objects of total size {total_size} {'are removed' if not args.dryrun_flag else 'would be removed but for dryrun flag'}"

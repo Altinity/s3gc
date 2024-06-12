@@ -47,7 +47,7 @@ There is a docker image for the script.
 ### rebuild
 ```
 make
-sudo docker build -t ilejn/s3gc .
+sudo docker buildx build --platform linux/arm/v7,linux/arm64/v8,linux/amd64 -t ilejn/s3gc .
 ```
 
 ### usage
@@ -55,3 +55,14 @@ sudo docker build -t ilejn/s3gc .
 sudo docker run ilejn/s3gc --help
 sudo docker run --network="host" -e S3GC_S3PORT=19000 -e S3GC_S3ACCESSKEY=minio99 -e S3GC_S3SECRETKEY=minio123 ilejn/s3gc
 ```
+
+## changelog
+
+### v_0.1 Wed Jun 12 2024
+
+object last modified in auxiliary table
+useage command line parameter
+
+## to do list
+1. option to avoid `remove_objects` which is reportedly not supported by GCE
+2. concurrency

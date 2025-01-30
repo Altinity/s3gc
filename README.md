@@ -27,11 +27,28 @@ If dryrun is set together with collectonly, error is raised.
 python3 s3gc.py --help
 ```
 ### typical usage
-#### all together
+#### all together with dry-run
 for https://altinity-clickhouse-data-demo20565656565620663600000001.s3.amazonaws.com/github
 ```
-S3GC_S3ACCESSKEY=sdfasfaerasasf  S3GC_S3SECRETKEY=werqwsdfqwersdfasf  S3GC_S3IP=s3.amazonaws.com S3GC_S3PORT=443 S3GC_S3REGION=us-east-1 S3GC_S3BUCKET=altinity-clickhouse-data-demo20565656565620663600000001 S3GC_S3PATH=github/ S3GC_S3SECURE_FLAG=true python3 ./s3gc.py --verbose
+S3GC_S3ACCESSKEY=sdfasfaerasasf  S3GC_S3SECRETKEY=werqwsdfqwersdfasf  S3GC_S3IP=s3.amazonaws.com S3GC_S3PORT=443 S3GC_S3REGION=us-east-1 S3GC_S3BUCKET=altinity-clickhouse-data-demo20565656565620663600000001 S3GC_S3PATH=github/ S3GC_S3SECURE_FLAG=true python3 ./s3gc.py --verbose --dry-run
 ```
+#### GCS and object storage that do not support batch delete operations
+```
+S3GC_S3ACCESSKEY=GOOG1xxxxxxxxx \
+S3GC_S3SECRETKEY=xxxxxxxxxxx \
+S3GC_S3IP=storage.googleapis.com \
+S3GC_S3PORT=443 \
+S3GC_S3BUCKET=opensystems-altinity-main-disk \
+S3GC_S3PATH=chi-main-main-0-0/ \
+S3GC_S3SECURE_FLAG=true \
+S3GC_S3DISKNAME=gcs \
+python3 ./s3gc.py --verbose --use-remove-objects=false
+```
+
+GCS_HMAC_KEY = S3GC_S3ACCESSKEY
+GCS_HMAC_SECRET = S3GC_S3SECRETKEY
+
+
 #### collect only
 ```
 S3GC_S3PORT=19000  S3GC_S3ACCESSKEY=minio99  S3GC_S3SECRETKEY=minio123  python3 ./s3gc.py --verbose --collectonly
@@ -64,5 +81,6 @@ object last modified in auxiliary table
 useage command line parameter
 
 ## to do list
-1. option to avoid `remove_objects` which is reportedly not supported by GCE
-2. concurrency
+~~1. option to avoid `remove_objects` which is reportedly not supported by GCE~~
+
+2. concurrency / async

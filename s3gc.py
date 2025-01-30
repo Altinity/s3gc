@@ -332,7 +332,7 @@ parser.add_argument(
     dest="use_remove_objects",
     type=bool,
     default=True,
-    help="use remove_objects (not supported by GCE)",
+    help="use remove_objects (not supported by GCE). Set it to false to use remove_object",
 )
 parser.add_argument(
     "--non-interactive",
@@ -671,11 +671,14 @@ def do_use():
         with ch_client.query_row_block_stream(antijoin) as stream:
             for block in stream:
                 objects_to_remove = []
+                object_to_remove = []
                 for row in block:
                     logger.debug(
                         f"{'removing' if not args.dryrun_flag else 'would remove if no dryrun flag'}  {row[0]} of size {row[1]}"
                     )
                     objects_to_remove.append(DeleteObject(row[0]))
+                    if args.use_remove_objects:
+                        object_to_remove.append(row[0])
                     objs.append([row[0], row[1], row[2], False])
                     total_size += row[1]
                 if not args.dryrun_flag:
@@ -686,9 +689,9 @@ def do_use():
                         for error in errors:
                             logger.info(f"error occurred when deleting object via remove_objects {error}")
                     else:
-                        for object_to_remove in objects_to_remove:
+                        for object_path in object_to_remove:
                             errors = minio_client.remove_object(
-                                args.s3bucket, object_to_remove
+                                args.s3bucket, object_path
                             )
                             for error in errors:
                                 logger.info(f"error occurred when deleting object via remove_object{error}")

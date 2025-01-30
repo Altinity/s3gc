@@ -327,6 +327,14 @@ parser.add_argument(
     help="drop collecttable and recreate; beware of ClickHouse DROP TABLE constraints",
 )
 parser.add_argument(
+    "--useremoveobjects",
+    "--use-remove-objects",
+    dest="use_remove_objects",
+    type=bool,
+    default=True,
+    help="use remove_objects (not supported by GCE)",
+)
+parser.add_argument(
     "--non-interactive",
     "--noninteractive",
     action="store_false",
@@ -671,11 +679,19 @@ def do_use():
                     objs.append([row[0], row[1], row[2], False])
                     total_size += row[1]
                 if not args.dryrun_flag:
-                    errors = minio_client.remove_objects(
-                        args.s3bucket, objects_to_remove
-                    )
-                    for error in errors:
-                        logger.info(f"error occurred when deleting object {error}")
+                    if args.use_remove_objects:
+                        errors = minio_client.remove_objects(
+                            args.s3bucket, objects_to_remove
+                        )
+                        for error in errors:
+                            logger.info(f"error occurred when deleting object via remove_objects {error}")
+                    else:
+                        for object_to_remove in objects_to_remove:
+                            errors = minio_client.remove_object(
+                                args.s3bucket, object_to_remove
+                            )
+                            for error in errors:
+                                logger.info(f"error occurred when deleting object via remove_object{error}")
 
                 num_removed += len(objects_to_remove)
 

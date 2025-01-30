@@ -690,12 +690,13 @@ def do_use():
                         for error in errors:
                             logger.info(f"error occurred when deleting object via remove_objects {error}")
                     else:
-                        for object_path in object_to_remove:
-                            errors = minio_client.remove_object(
-                                args.s3bucket, object_path
-                            )
-                            for error in errors:
-                                logger.info(f"error occurred when deleting object via remove_object{error}")
+                        try:
+                            for object_path in object_to_remove:
+                                minio_client.remove_object(
+                                    args.s3bucket, object_path
+                                )
+                        except Exception as error:
+                            logger.info(f"error occurred when deleting object {object_path} via remove_object {error}")
 
                 num_removed += len(objects_to_remove)
 

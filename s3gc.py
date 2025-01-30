@@ -676,8 +676,9 @@ def do_use():
                     logger.debug(
                         f"{'removing' if not args.dryrun_flag else 'would remove if no dryrun flag'}  {row[0]} of size {row[1]}"
                     )
-                    objects_to_remove.append(DeleteObject(row[0]))
                     if args.use_remove_objects:
+                        objects_to_remove.append(DeleteObject(row[0]))
+                    else:
                         object_to_remove.append(row[0])
                     objs.append([row[0], row[1], row[2], False])
                     total_size += row[1]

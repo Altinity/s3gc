@@ -20,6 +20,9 @@ Besides this, it is possible to calculate objects to remove without actual remov
 If dryrun is set together with usecollected, it uses collected data.
 If dryrun is set together with collectonly, error is raised.
 
+It is important to use `--s3diskname` if your disk name is not `s3` which is by default.
+
+WARNING!: Please use `--dry-run` to check and compare results of what is going to be deleted, just to be on the safe side. 
 
 ## script invocation
 ### help
@@ -30,7 +33,15 @@ python3 s3gc.py --help
 #### all together with dry-run
 for https://altinity-clickhouse-data-demo20565656565620663600000001.s3.amazonaws.com/github
 ```
-S3GC_S3ACCESSKEY=sdfasfaerasasf  S3GC_S3SECRETKEY=werqwsdfqwersdfasf  S3GC_S3IP=s3.amazonaws.com S3GC_S3PORT=443 S3GC_S3REGION=us-east-1 S3GC_S3BUCKET=altinity-clickhouse-data-demo20565656565620663600000001 S3GC_S3PATH=github/ S3GC_S3SECURE_FLAG=true python3 ./s3gc.py --verbose --dry-run
+S3GC_S3ACCESSKEY=sdfasfaerasasf \
+S3GC_S3SECRETKEY=werqwsdfqwersdfasf \
+S3GC_S3IP=s3.amazonaws.com \
+S3GC_S3PORT=443 \
+S3GC_S3REGION=us-east-1 \
+S3GC_S3BUCKET=altinity-clickhouse-data-demo20565656565620663600000001 \
+S3GC_S3PATH=github/ \
+S3GC_S3SECURE_FLAG=true \
+python3 ./s3gc.py --verbose --dry-run
 ```
 #### GCS and object storage that do not support batch delete operations
 ```
@@ -38,7 +49,7 @@ S3GC_S3ACCESSKEY=GOOG1xxxxxxxxx \
 S3GC_S3SECRETKEY=xxxxxxxxxxx \
 S3GC_S3IP=storage.googleapis.com \
 S3GC_S3PORT=443 \
-S3GC_S3BUCKET=opensystems-altinity-main-disk \
+S3GC_S3BUCKET=clickhouse-altinity-main-disk \
 S3GC_S3PATH=chi-main-main-0-0/ \
 S3GC_S3SECURE_FLAG=true \
 S3GC_S3DISKNAME=gcs \

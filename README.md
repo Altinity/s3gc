@@ -88,10 +88,13 @@ sudo docker run --network="host" -e S3GC_S3PORT=19000 -e S3GC_S3ACCESSKEY=minio9
 
 ### v_0.1 Wed Jun 12 2024
 
-object last modified in auxiliary table
-useage command line parameter
+- object last modified in auxiliary table
+- useage command line parameter
+  
+### v_0.2 Fri Jan 31 2025
+- added option to avoid batch deletion for services like GCS
 
 ## to do list
 ~~1. option to avoid `remove_objects` which is reportedly not supported by GCE~~
 
-2. concurrency / async
+- concurrency / async

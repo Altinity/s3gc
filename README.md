@@ -25,10 +25,22 @@ It is important to use `--s3diskname` if your disk name is not `s3` which is by 
 WARNING!: Please use `--dry-run` to check and compare results of what is going to be deleted, just to be on the safe side. 
 
 ## script invocation
+### install
+Install the Python dependencies, ideally in a virtualenv:
+```
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+On Debian/Ubuntu/WSL you may first need `sudo apt install -y python3-pip python3-venv`.
+Without a virtualenv, use `pip install --user -r requirements.txt` (add
+`--break-system-packages` if pip refuses on an externally-managed Python).
+
 ### help
 ```
 python3 s3gc.py --help
 ```
+
 ### typical usage
 #### all together with dry-run
 for https://altinity-clickhouse-data-demo20565656565620663600000001.s3.amazonaws.com/github
@@ -43,6 +55,30 @@ S3GC_S3PATH=github/ \
 S3GC_S3SECURE_FLAG=true \
 python3 ./s3gc.py --verbose --dry-run
 ```
+#### AWS SSO or AWS profile credentials
+Authenticate with AWS CLI first, then let `s3gc` resolve temporary credentials through the boto3 credential chain.
+```
+aws sso login --profile my-sso-profile
+
+S3GC_S3AUTH=aws \
+S3GC_S3PROFILE=my-sso-profile \
+S3GC_S3IP=s3.amazonaws.com \
+S3GC_S3PORT=443 \
+S3GC_S3REGION=us-east-1 \
+S3GC_S3BUCKET=altinity-clickhouse-data-demo20565656565620663600000001 \
+S3GC_S3PATH=github/ \
+S3GC_S3SECURE_FLAG=true \
+python3 ./s3gc.py --verbose --dry-run
+```
+
+`S3GC_S3ACCESSKEY` and `S3GC_S3SECRETKEY` are not used with `S3GC_S3AUTH=aws`.
+The selected credentials must allow `s3:ListBucket` on the bucket for
+`S3GC_S3PATH`, even for `--dry-run`. Verify the same profile with:
+```
+aws sts get-caller-identity --profile my-sso-profile
+aws s3api list-objects-v2 --bucket altinity-clickhouse-data-demo20565656565620663600000001 --prefix github/ --max-keys 1 --profile my-sso-profile
+```
+
 #### GCS and object storage that do not support batch delete operations
 ```
 S3GC_S3ACCESSKEY=GOOG1xxxxxxxxx \
@@ -93,6 +129,9 @@ sudo docker run --network="host" -e S3GC_S3PORT=19000 -e S3GC_S3ACCESSKEY=minio9
   
 ### v_0.2 Fri Jan 31 2025
 - added option to avoid batch deletion for services like GCS
+
+### v_0.3 Mon Jun 15 2026
+- added s3 profile option
 
 ## to do list
 ~~1. option to avoid `remove_objects` which is reportedly not supported by GCE~~

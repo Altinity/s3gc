@@ -1,3 +1,4 @@
 Minio
+boto3
 clickhouse_connect
 jsonargparse[all]

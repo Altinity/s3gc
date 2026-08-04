@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 options.lst
 .pytest_cache/
+.venv

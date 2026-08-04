@@ -103,6 +103,25 @@ export S3GC_CHPASS='<clickhouse-password>'
 export S3GC_S3USEIAM=true
 ```
 
+### IAM role support
+
+With `S3GC_S3USEIAM=true`, `s3gc` uses MinIO's AWS IAM credential provider.
+It obtains and refreshes temporary credentials from one of these environments:
+
+- an EKS Pod using IRSA/workload identity (`AWS_WEB_IDENTITY_TOKEN_FILE` and
+  `AWS_ROLE_ARN`);
+- an EC2 instance with an attached instance profile; or
+- an ECS task with task-role credentials.
+
+Setting `S3GC_S3USEIAM=true` on an ordinary workstation is not enough. The
+current provider does **not** read AWS CLI profiles, `aws sso login` state,
+`~/.aws/config`, or `AWS_PROFILE`. For a direct local run, use static S3 keys
+or run the script from an identity-enabled EC2/EKS/ECS environment.
+
+The static-key path accepts an access key and secret key only; it does not yet
+accept an AWS session token. Therefore, do not copy temporary
+`aws sts assume-role` credentials into the static-key variables.
+
 Run the safe, split workflow directly. Collection makes an auxiliary table;
 the second command reads it and reports candidates without deleting objects:
 

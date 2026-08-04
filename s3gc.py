@@ -19,6 +19,7 @@ import sys
 from io import StringIO
 from minio import Minio
 from minio.deleteobjects import DeleteObject
+from minio.credentials import IamAwsProvider
 from contextlib import redirect_stdout
 import clickhouse_connect
 
@@ -31,12 +32,21 @@ from jsonargparse.typing import Optional
 import urllib3
 import logging
 import datetime
-from distutils.util import strtobool
 
 usage = """
     s3 garbage collector for ClickHouse
     example: $ ./s3gc.py
 """
+
+
+def strtobool(value):
+    """Minimal stdlib-compatible replacement for distutils.util.strtobool."""
+    normalized = value.lower()
+    if normalized in {"y", "yes", "t", "true", "on", "1"}:
+        return 1
+    if normalized in {"n", "no", "f", "false", "off", "0"}:
+        return 0
+    raise ValueError(f"invalid truth value {value!r}")
 
 parser = ArgumentParser(
     usage=usage, env_prefix="S3GC", default_env=True, exit_on_error=False
@@ -138,6 +148,14 @@ parser.add_argument(
     dest="s3diskname",
     default="s3",
     help="S3 disk name",
+)
+parser.add_argument(
+    "--s3useiam",
+    "--s3-use-iam",
+    action="store_true",
+    dest="s3useiam",
+    default=False,
+    help="Use the AWS SDK-compatible workload identity credential chain instead of static S3 keys",
 )
 parser.add_argument(
     "--keepdata",
@@ -257,6 +275,12 @@ parser.add_argument(
     help="Consider an objects unused if there is no host in the cluster refers the object",
 )
 parser.add_argument(
+    "--expected-replicas",
+    dest="expected_replicas",
+    type=Optional[int],
+    help="Fail before deleting when clusterAllReplicas() does not return this many replicas",
+)
+parser.add_argument(
     "--age",
     "--hours",
     "--age-hours",
@@ -283,6 +307,14 @@ parser.add_argument(
     type=int,
     default=4,
     help="Number of partitions in auxiliary table",
+)
+parser.add_argument(
+    "--deletebatchsize",
+    "--delete-batch-size",
+    dest="deletebatchsize",
+    type=int,
+    default=1000,
+    help="S3 objects to delete and checkpoint per progress batch",
 )
 parser.add_argument(
     "--chtimeout",
@@ -422,7 +454,7 @@ if args.listoptions:
         if key in ["listoptions"]:
             continue
         if backslash:
-            print(" \\ ")
+            print(" \\")
         print(f" S3GC_{key.upper()}={value}", end="")
 
         backslash = True
@@ -500,6 +532,45 @@ minio_client = None
 ch_client = None
 
 
+class S3DeletionError(RuntimeError):
+    """A delete failed after successful deletions were checkpointed."""
+
+
+def _query_single_value(query):
+    result = ch_client.query(query)
+    if not result.result_rows or not result.result_rows[0]:
+        raise RuntimeError(f"ClickHouse returned no result for preflight query: {query}")
+    return result.result_rows[0][0]
+
+
+def preflight_cluster():
+    """Make destructive cluster-wide cleanup fail closed when topology is unexpected."""
+    if not args.expected_replicas:
+        return
+    if not args.clustername:
+        raise ValueError("--expected-replicas requires --cluster")
+
+    actual_cluster = _query_single_value("SELECT getMacro('cluster')")
+    if actual_cluster != args.clustername:
+        raise RuntimeError(
+            f"cluster preflight failed: expected local cluster macro {args.clustername!r}, "
+            f"got {actual_cluster!r}"
+        )
+
+    cluster_name = args.clustername.replace("'", "\\\\'")
+    actual_replicas = _query_single_value(
+        f"SELECT count() FROM clusterAllReplicas('{cluster_name}', system.one)"
+    )
+    if actual_replicas != args.expected_replicas:
+        raise RuntimeError(
+            f"replica preflight failed: expected {args.expected_replicas}, got {actual_replicas}"
+        )
+
+    logger.info(
+        f"cluster preflight passed: cluster={args.clustername}, replicas={actual_replicas}"
+    )
+
+
 def connect_to_ch():
     logger.info(
         f"Connecting to ClickHouse, host={args.chhost}, port={args.chport}, username={args.chuser}, password={args.chpass}, s3path={args.s3path}, bucket={args.s3bucket}, s3path={args.s3path}"
@@ -519,17 +590,25 @@ def connect_to_s3():
         logger.debug(f"using SSL certificate {args.s3sslcertfile}")
         os.environ["SSL_CERT_FILE"] = args.s3sslcertfile
 
+    authentication = "AWS workload identity" if args.s3useiam else "static credentials"
     logger.info(
-        f"Connecting to S3, host:port={args.s3ip}:{args.s3port}, access_key={args.s3accesskey}, secret_key={args.s3secretkey}, secure={args.s3secure_flag}, region={args.s3region}"
+        f"Connecting to S3, host:port={args.s3ip}:{args.s3port}, authentication={authentication}, "
+        f"secure={args.s3secure_flag}, region={args.s3region}"
     )
     global minio_client
+    connection_options = {
+        "secure": args.s3secure_flag,
+        "region": args.s3region,
+        "http_client": urllib3.PoolManager(cert_reqs="CERT_NONE"),
+    }
+    if args.s3useiam:
+        connection_options["credentials"] = IamAwsProvider()
+    else:
+        connection_options["access_key"] = args.s3accesskey
+        connection_options["secret_key"] = args.s3secretkey
     minio_client = Minio(
         f"{args.s3ip}:{args.s3port}",
-        access_key=args.s3accesskey,
-        secret_key=args.s3secretkey,
-        secure=args.s3secure_flag,
-        region=args.s3region,
-        http_client=urllib3.PoolManager(cert_reqs="CERT_NONE"),
+        **connection_options,
     )
 
 
@@ -595,6 +674,9 @@ def do_collect():
 
 
 def do_use():
+    if not args.dryrun_flag:
+        preflight_cluster()
+
     srdp = "system.remote_data_paths"
     if args.clustername:
         srdp = f"clusterAllReplicas('{args.clustername}', {srdp})"
@@ -662,46 +744,76 @@ def do_use():
 
     num_removed = 0
     total_size = 0
-    objs = []
-
+    if not args.dryrun_flag and args.deletebatchsize < 1:
+        raise ValueError("--deletebatchsize must be a positive integer")
     for sample in range(0, args.samples):
         antijoin = make_antijoin(sample=sample)
         logger.info(f"antijoin {antijoin}")
 
         with ch_client.query_row_block_stream(antijoin) as stream:
             for block in stream:
-                objects_to_remove = []
-                object_to_remove = []
+                selected_rows = []
                 for row in block:
                     logger.debug(
                         f"{'removing' if not args.dryrun_flag else 'would remove if no dryrun flag'}  {row[0]} of size {row[1]}"
                     )
+                    selected_rows.append(row)
+
+                if args.dryrun_flag:
+                    num_removed += len(selected_rows)
+                    total_size += sum(row[1] for row in selected_rows)
+                    continue
+
+                for offset in range(0, len(selected_rows), args.deletebatchsize):
+                    batch_rows = selected_rows[offset : offset + args.deletebatchsize]
+                    errors = []
                     if args.use_remove_objects:
-                        objects_to_remove.append(DeleteObject(row[0]))
-                    else:
-                        object_to_remove.append(row[0])
-                    objs.append([row[0], row[1], row[2], False])
-                    total_size += row[1]
-                if not args.dryrun_flag:
-                    if args.use_remove_objects:
-                        errors = minio_client.remove_objects(
-                            args.s3bucket, objects_to_remove
-                        )
+                        errors = list(minio_client.remove_objects(
+                            args.s3bucket, [DeleteObject(row[0]) for row in batch_rows]
+                        ))
                         for error in errors:
                             logger.info(f"error occurred when deleting object via remove_objects {error}")
+
+                        failed_names = {
+                            getattr(error, "object_name", None) or getattr(error, "name", None)
+                            for error in errors
+                        }
+                        if None in failed_names:
+                            # Do not tombstone any object for an uncorrelatable batch error.
+                            successful_rows = []
+                        else:
+                            successful_rows = [
+                                row for row in batch_rows if row[0] not in failed_names
+                            ]
                     else:
-                        for object_path in object_to_remove:
+                        successful_rows = []
+                        for row in batch_rows:
                             try:
-                                minio_client.remove_object(
-                                    args.s3bucket, object_path
-                                )
+                                minio_client.remove_object(args.s3bucket, row[0])
+                                successful_rows.append(row)
                             except Exception as error:
-                                logger.info(f"error occurred when deleting object {object_path} via remove_object {error}")
+                                logger.info(f"error occurred when deleting object {row[0]} via remove_object {error}")
+                                errors.append(error)
 
-                num_removed += len(objects_to_remove)
+                    if successful_rows:
+                        tombstones = [
+                            [row[0], row[1], row[2], False] for row in successful_rows
+                        ]
+                        ch_client.insert(
+                            tname,
+                            tombstones,
+                            column_names=["objpath", "size", "last_modified", "active"],
+                        )
+                        num_removed += len(successful_rows)
+                        total_size += sum(row[1] for row in successful_rows)
+                        logger.info(
+                            f"delete checkpoint: {num_removed} objects / {total_size} bytes removed so far"
+                        )
 
-        if not args.dryrun_flag:
-            ch_client.insert(tname, objs, column_names=["objpath", "size", "last_modified", "active"])
+                    if errors:
+                        raise S3DeletionError(
+                            f"{len(errors)} S3 deletion error(s); successful deletes were checkpointed"
+                        )
 
     logger.info(
         f"{num_removed} objects of total size {total_size} {'are removed' if not args.dryrun_flag else 'would be removed but for dryrun flag'}"

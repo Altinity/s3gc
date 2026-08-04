@@ -72,17 +72,31 @@ S3GC_S3PORT=19000  S3GC_S3ACCESSKEY=minio99  S3GC_S3SECRETKEY=minio123 S3GC_USEC
 ## docker
 There is a docker image for the script.
 
+The published image is pinned to Python 3.11 for reproducibility.
+
+When regenerating the Dockerfile defaults, run `make` with an interpreter that
+has the pinned requirements installed, for example
+`make PYTHON=.venv/bin/python`.
+
 ### rebuild
 ```
 make
-sudo docker buildx build --platform linux/arm/v7,linux/arm64/v8,linux/amd64 -t ilejn/s3gc .
+sudo docker buildx build --platform linux/arm/v7,linux/arm64/v8,linux/amd64 -t altinity/s3gc .
 ```
 
 ### usage
 ```
-sudo docker run ilejn/s3gc --help
-sudo docker run --network="host" -e S3GC_S3PORT=19000 -e S3GC_S3ACCESSKEY=minio99 -e S3GC_S3SECRETKEY=minio123 ilejn/s3gc
+sudo docker run altinity/s3gc --help
+sudo docker run --network="host" -e S3GC_S3PORT=19000 -e S3GC_S3ACCESSKEY=minio99 -e S3GC_S3SECRETKEY=minio123 altinity/s3gc
 ```
+
+## Kubernetes
+
+`deploy/kubernetes/` contains a plain-template one-shot Job runner for running
+the collector inside the ClickHouse namespace. It has separate `collect`,
+`dry-run`, and guarded `delete` phases and does not create or contain secrets.
+See [deploy/kubernetes/README.md](deploy/kubernetes/README.md) for the render
+contract and safety requirements.
 
 ## changelog
 

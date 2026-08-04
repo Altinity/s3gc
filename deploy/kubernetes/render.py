@@ -63,11 +63,11 @@ def validate(values: dict[str, str]) -> None:
     missing = sorted(REQUIRED - values.keys())
     if missing:
         raise ValueError("missing required values: " + ", ".join(missing))
-    if values["PHASE"] not in {"collect", "dry-run", "delete"}:
-        raise ValueError("PHASE must be collect, dry-run, or delete")
-    if values["PHASE"] == "delete" and values.get("DELETE_CONFIRMATION") != DELETE_CONFIRMATION:
+    if values["PHASE"] not in {"collect", "dry-run", "delete", "dev-automation"}:
+        raise ValueError("PHASE must be collect, dry-run, delete, or dev-automation")
+    if values["PHASE"] in {"delete", "dev-automation"} and values.get("DELETE_CONFIRMATION") != DELETE_CONFIRMATION:
         raise ValueError(
-            f"delete requires DELETE_CONFIRMATION={DELETE_CONFIRMATION}"
+            f"{values['PHASE']} requires DELETE_CONFIRMATION={DELETE_CONFIRMATION}"
         )
     if not JOB_NAME_RE.fullmatch(values["JOB_NAME"]) or len(values["JOB_NAME"]) > 63:
         raise ValueError("JOB_NAME must be a DNS label of at most 63 characters")

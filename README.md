@@ -1,141 +1,202 @@
 # s3gc
-Garbage collector for ClickHouse S3 disks
 
-## Repository layout
+`s3gc` finds and removes orphaned objects from ClickHouse S3 disks and other
+S3-compatible storage. An object is a candidate only when it exists under the
+configured bucket/prefix but is absent from ClickHouse
+`system.remote_data_paths` for the configured disk.
 
-- `s3gc.py` — collector and deletion logic.
-- `docker/` — reproducible Python 3.11 container packaging.
-- `deploy/kubernetes/` — generic one-shot Kubernetes Job renderer and operator runbook.
-- `tests/` — safety and renderer unit tests.
+## How it works
 
-The repository is intentionally public and contains no target-cluster details,
-credentials, rendered manifests, or environment configuration. Operators keep
-those values outside Git and deploy an image pinned by digest.
+1. Collect object names, sizes, and timestamps into an auxiliary ClickHouse
+   table.
+2. Anti-join that inventory with `system.remote_data_paths` (or all replicas of
+   a configured cluster).
+3. Report candidates in dry-run mode, or delete them in batches and record
+   confirmed deletion checkpoints in the auxiliary table.
 
-## Testing
+The command-line script supports these actions directly. For Kubernetes, the
+repository supplies a one-shot Job runner that separates collection, review,
+and deletion.
 
-Install test-only dependencies with
-`uv pip install --python .venv/bin/python -r requirements-dev.txt`, then run
-the isolated unit suite with:
+## Safety
 
-```
-.venv/bin/python -m pytest -v
-```
+Deleting an object is irreversible. Always run and review a dry-run before
+deletion, and scope the configured bucket and prefix as narrowly as possible.
 
-Tests marked `dev_cluster` require the dedicated development Kubernetes cluster
-and are never run by CI. They must be selected explicitly with
-`pytest -m dev_cluster` after reviewing their fixture scope.
+- Use a unique collection-table prefix for each cleanup.
+- For clustered ClickHouse, use the cluster name and expected replica count.
+- A failed delete Job does not automatically retry. Successfully deleted
+  batches remain checkpointed, so a replacement delete Job can resume safely.
+- Never put credentials, customer manifests, or target-cluster details in Git.
 
-## description
-The script removes orphaned objects from s3 object storage
-  Ones that are not mentioned in system.remote_data_paths table
+## Requirements
 
-There are two stages:
-1. Collecting.
-     Paths of all objects found in object storage are put in auxiliary ClickHouse table.
-       It's name is a concatenation of 's3objects_for_' and disk name by default.
-       Created in the same ClickHouse instance where data from system.remote_data_paths selected
-2. Removing.
-     All objects that exist in s3 and not used according to system.remote_data_paths
-       are removed from object storage.
+- Python 3.11 for local development; the container image also uses Python 3.11.
+- Network access to ClickHouse and the target S3-compatible endpoint.
+- A ClickHouse user that can read `system.remote_data_paths` and manage the
+  auxiliary table.
+- S3 permissions appropriate to the action: list for collection, plus delete
+  for deletion.
 
-It is possible to split these stages or do everything at one go.
+## Quick start
 
-Besides this, it is possible to calculate objects to remove without actual removing AKA dry run.
-If dryrun is set together with usecollected, it uses collected data.
-If dryrun is set together with collectonly, error is raised.
+Create a local environment and inspect the available options:
 
-It is important to use `--s3diskname` if your disk name is not `s3` which is by default.
-
-WARNING!: Please use `--dry-run` to check and compare results of what is going to be deleted, just to be on the safe side. 
-
-## script invocation
-### help
-```
-python3 s3gc.py --help
-```
-### typical usage
-#### all together with dry-run
-for https://altinity-clickhouse-data-demo20565656565620663600000001.s3.amazonaws.com/github
-```
-S3GC_S3ACCESSKEY=sdfasfaerasasf \
-S3GC_S3SECRETKEY=werqwsdfqwersdfasf \
-S3GC_S3IP=s3.amazonaws.com \
-S3GC_S3PORT=443 \
-S3GC_S3REGION=us-east-1 \
-S3GC_S3BUCKET=altinity-clickhouse-data-demo20565656565620663600000001 \
-S3GC_S3PATH=github/ \
-S3GC_S3SECURE_FLAG=true \
-python3 ./s3gc.py --verbose --dry-run
-```
-#### GCS and object storage that do not support batch delete operations
-```
-S3GC_S3ACCESSKEY=GOOG1xxxxxxxxx \
-S3GC_S3SECRETKEY=xxxxxxxxxxx \
-S3GC_S3IP=storage.googleapis.com \
-S3GC_S3PORT=443 \
-S3GC_S3BUCKET=clickhouse-altinity-main-disk \
-S3GC_S3PATH=chi-main-main-0-0/ \
-S3GC_S3SECURE_FLAG=true \
-S3GC_S3DISKNAME=gcs \
-python3 ./s3gc.py --verbose --use-remove-objects=false
+```bash
+python3.11 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt -r requirements-dev.txt
+.venv/bin/python s3gc.py --help
 ```
 
-GCS_HMAC_KEY = S3GC_S3ACCESSKEY
-GCS_HMAC_SECRET = S3GC_S3SECRETKEY
+Configuration can be supplied as command-line arguments or `S3GC_*`
+environment variables. Set the ClickHouse connection, S3 endpoint/bucket/prefix,
+region, disk name, and either static S3 keys or workload identity. Keep secrets
+in your approved secret manager or environment, not in command history.
 
+Run a dry-run first:
 
-#### collect only
-```
-S3GC_S3PORT=19000  S3GC_S3ACCESSKEY=minio99  S3GC_S3SECRETKEY=minio123  python3 ./s3gc.py --verbose --collectonly
-```
-#### use collected
-```
-S3GC_S3PORT=19000  S3GC_S3ACCESSKEY=minio99  S3GC_S3SECRETKEY=minio123 S3GC_USECOLLECTED=true  python3 ./s3gc.py --debug
+```bash
+.venv/bin/python s3gc.py --verbose --dry-run
 ```
 
-## docker
-There is a docker image for the script.
+For a production or customer cleanup, use the Kubernetes procedure below rather
+than a one-line delete command.
 
-Development, CI, and the image use Python 3.11. With `uv` installed, create the
-local environment with `uv venv --python 3.11 .venv`, then install the pinned
-requirements with `uv pip install --python .venv/bin/python -r requirements.txt`.
+## Direct script examples
 
-### rebuild
-```
-docker buildx build --platform linux/amd64,linux/arm64 -f docker/Dockerfile -t altinity/s3gc .
+The following is a non-secret target configuration. Replace every
+`<placeholder>` value and do not commit this environment to Git:
+
+```bash
+export S3GC_CHHOST='<clickhouse-host>'
+export S3GC_CHPORT=8123
+export S3GC_CHUSER='<clickhouse-user>'
+export S3GC_S3IP='s3.eu-central-1.amazonaws.com'
+export S3GC_S3PORT=443
+export S3GC_S3BUCKET='<bucket>'
+export S3GC_S3PATH='<only-the-target-prefix>/'
+export S3GC_S3REGION='eu-central-1'
+export S3GC_S3SECURE_FLAG=true
+export S3GC_S3DISKNAME=s3
+export S3GC_CLUSTERNAME='<clickhouse-cluster>'
+export S3GC_EXPECTED_REPLICAS=2
+export S3GC_COLLECTTABLEPREFIX='s3gc_example_'
+export S3GC_AGE=24
+export S3GC_USEAGE=24
 ```
 
-### usage
+For static S3 credentials, inject the following values from a secret manager
+or interactive shell rather than saving them in a file:
+
+```bash
+export S3GC_CHPASS='<clickhouse-password>'
+export S3GC_S3ACCESSKEY='<s3-access-key>'
+export S3GC_S3SECRETKEY='<s3-secret-key>'
+export S3GC_S3USEIAM=false
 ```
-docker run altinity/s3gc --help
-docker run --network="host" -e S3GC_S3PORT=19000 -e S3GC_S3ACCESSKEY=minio99 -e S3GC_S3SECRETKEY=minio123 altinity/s3gc
+
+For an identity-enabled environment such as EKS/IRSA, do not set static S3
+keys; use the workload identity available to the process instead:
+
+```bash
+export S3GC_CHPASS='<clickhouse-password>'
+export S3GC_S3USEIAM=true
 ```
+
+Run the safe, split workflow directly. Collection makes an auxiliary table;
+the second command reads it and reports candidates without deleting objects:
+
+```bash
+.venv/bin/python s3gc.py --collectonly --keepdata
+.venv/bin/python s3gc.py --usecollected --dry-run
+```
+
+The same variables can be passed as flags (for example,
+`--ch-host` or `--s3-bucket`). Run `.venv/bin/python s3gc.py --help` for the
+complete flag and environment-variable reference. Avoid direct deletion for
+customer or production work; use the reviewed Kubernetes workflow instead.
+
+## Container image
+
+Build the image locally:
+
+```bash
+docker build -f docker/Dockerfile -t s3gc:local .
+```
+
+For a Kubernetes image, build and publish both supported architectures:
+
+```bash
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -f docker/Dockerfile -t <registry>/s3gc:<tag> --push .
+```
+
+The CI workflow publishes only from trusted pushes to protected `master`;
+pull requests run tests but do not receive registry credentials.
 
 ## Kubernetes
 
-`deploy/kubernetes/` contains a plain-template one-shot Job runner for running
-the collector inside the ClickHouse namespace. It has separate `collect`,
-`dry-run`, and guarded `delete` phases, plus a guarded `dev-automation` phase
-for non-production testing, and does not create or contain secrets.
-See [deploy/kubernetes/README.md](deploy/kubernetes/README.md) for the render
-contract and safety requirements.
+The Kubernetes runner lives in [`deploy/kubernetes/`](deploy/kubernetes/). It
+uses a digest-pinned image and external Kubernetes Secrets; it does not create
+or store credentials in the repository.
 
-Images are published only by the GitHub Actions workflow after a trusted push to
-protected `master`. Pull requests run tests without registry credentials and do
-not publish an image.
+For customer and production work, follow:
 
-## changelog
+```text
+collect → dry-run → approved delete → verify
+```
 
-### v_0.1 Wed Jun 12 2024
+The concise operator procedure, Secret requirements, and renderer configuration
+are in [deploy/kubernetes/README.md](deploy/kubernetes/README.md). A guarded
+`dev-automation` phase is available only for non-production testing; it runs
+collect, dry-run, and delete in one Job and still requires an explicit delete
+confirmation.
 
-- object last modified in auxiliary table
-- useage command line parameter
-  
-### v_0.2 Fri Jan 31 2025
-- added option to avoid batch deletion for services like GCS
+## Testing
 
-## to do list
-~~1. option to avoid `remove_objects` which is reportedly not supported by GCE~~
+Run all isolated unit tests:
 
-- concurrency / async
+```bash
+.venv/bin/python -m pytest -v
+```
+
+Run only the development-automation tests:
+
+```bash
+.venv/bin/python -m pytest -v -k dev_automation
+```
+
+Validate that the example Kubernetes configuration renders without creating a
+cluster resource:
+
+```bash
+python3 deploy/kubernetes/render.py deploy/kubernetes/example.env > /tmp/s3gc-job.yaml
+kubectl apply --dry-run=client -f /tmp/s3gc-job.yaml
+```
+
+The unit suite does not contact ClickHouse, S3, or Kubernetes. The reserved
+`dev_cluster` pytest marker is excluded from CI; any future tests using it must
+be selected explicitly with `.venv/bin/python -m pytest -m dev_cluster` after
+reviewing their fixture scope. The collect/dry-run/delete exercise is manual
+because it can intentionally delete development objects.
+
+## Repository layout
+
+- `s3gc.py` — collection, anti-join, and deletion logic.
+- `docker/` — Python 3.11 container image and Kubernetes entrypoint.
+- `deploy/kubernetes/` — plain Job template, renderer, example configuration,
+  and operator guide.
+- `tests/` — pytest safety, renderer, and entrypoint tests.
+
+## History and roadmap
+
+### v0.2 — 2025-01-31
+
+- Added an option to avoid batch deletion for services such as GCS.
+
+### v0.1 — 2024-06-12
+
+- Added object last-modified timestamps to the auxiliary table.
+- Added the object age option.
+
+Planned: concurrency and asynchronous collection/deletion.

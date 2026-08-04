@@ -1,23 +1,13 @@
 import os
-import runpy
 import subprocess
 import sys
-import tempfile
 import types
-import unittest
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def load_s3gc():
-    original_argv = sys.argv[:]
-    try:
-        sys.argv = [str(ROOT / "s3gc.py")]
-        return runpy.run_path(str(ROOT / "s3gc.py"), run_name="s3gc_test")
-    finally:
-        sys.argv = original_argv
 
 
 class QueryResult:
@@ -42,6 +32,7 @@ class FakeCH:
         self.replicas = replicas
         self.blocks = blocks
         self.inserts = []
+        self.stream_query = ""
 
     def query(self, query):
         if "getMacro" in query:
@@ -56,6 +47,7 @@ class FakeCH:
         raise AssertionError(query)
 
     def query_row_block_stream(self, query):
+        self.stream_query = query
         return FakeStream(self.blocks)
 
     def insert(self, table, rows, column_names):
@@ -67,110 +59,179 @@ class DeleteError:
         self.name = name
 
 
-class FakeMinio:
+class FailingMinio:
     def remove_objects(self, bucket, objects):
         return iter([DeleteError("bad-object")])
 
 
-def use_args(**overrides):
-    values = {
-        "clustername": "cluster",
-        "expected_replicas": 2,
-        "dryrun_flag": False,
-        "s3diskname": "s3",
-        "useafter": None,
-        "useage": 24,
-        "usetotal": None,
-        "samples": 1,
-        "deletebatchsize": 1000,
-        "interactive_flag": False,
-        "use_remove_objects": True,
-        "s3bucket": "bucket",
-        "keepdata_flag": True,
-        "silent_flag": True,
-    }
-    values.update(overrides)
-    return types.SimpleNamespace(**values)
+@pytest.fixture
+def args_factory():
+    def make_args(**overrides):
+        values = {
+            "clustername": "cluster",
+            "expected_replicas": 2,
+            "dryrun_flag": False,
+            "s3diskname": "s3",
+            "useafter": None,
+            "useage": 24,
+            "usetotal": None,
+            "samples": 1,
+            "deletebatchsize": 1000,
+            "order_by_objpath": False,
+            "interactive_flag": False,
+            "use_remove_objects": True,
+            "s3bucket": "bucket",
+            "keepdata_flag": True,
+            "silent_flag": True,
+        }
+        values.update(overrides)
+        return types.SimpleNamespace(**values)
+
+    return make_args
 
 
-class S3GCTest(unittest.TestCase):
-    def test_preflight_rejects_wrong_cluster(self):
-        module = load_s3gc()
-        namespace = module["preflight_cluster"].__globals__
-        namespace["args"] = use_args(clustername="expected")
-        namespace["ch_client"] = FakeCH(cluster="actual")
+def test_preflight_rejects_wrong_cluster(s3gc_module, args_factory, monkeypatch):
+    namespace = s3gc_module["preflight_cluster"].__globals__
+    monkeypatch.setitem(namespace, "args", args_factory(clustername="expected"))
+    monkeypatch.setitem(namespace, "ch_client", FakeCH(cluster="actual"))
 
-        with self.assertRaisesRegex(RuntimeError, "cluster preflight failed"):
-            module["preflight_cluster"]()
+    with pytest.raises(RuntimeError, match="cluster preflight failed"):
+        s3gc_module["preflight_cluster"]()
 
-    def test_batch_errors_checkpoint_only_confirmed_deletes(self):
-        module = load_s3gc()
-        namespace = module["do_use"].__globals__
-        namespace["args"] = use_args()
-        namespace["ch_client"] = FakeCH(
-            blocks=[[("good-object", 10, "time"), ("bad-object", 20, "time")]]
+
+def test_batch_errors_checkpoint_only_confirmed_deletes(
+    s3gc_module, args_factory, monkeypatch
+):
+    namespace = s3gc_module["do_use"].__globals__
+    client = FakeCH(blocks=[[("good-object", 10, "time"), ("bad-object", 20, "time")]])
+    monkeypatch.setitem(namespace, "args", args_factory())
+    monkeypatch.setitem(namespace, "ch_client", client)
+    monkeypatch.setitem(namespace, "minio_client", FailingMinio())
+
+    with pytest.raises(s3gc_module["S3DeletionError"]):
+        s3gc_module["do_use"]()
+
+    assert client.inserts == [
+        (
+            "`s3objects_for_s3`",
+            [["good-object", 10, "time", False]],
+            ["objpath", "size", "last_modified", "active"],
         )
-        namespace["minio_client"] = FakeMinio()
+    ]
 
-        with self.assertRaises(module["S3DeletionError"]):
-            module["do_use"]()
 
-        self.assertEqual(len(namespace["ch_client"].inserts), 1)
-        self.assertEqual(
-            namespace["ch_client"].inserts[0][1], [["good-object", 10, "time", False]]
-        )
+def test_delete_batches_are_checkpointed_independently(
+    s3gc_module, args_factory, monkeypatch
+):
+    namespace = s3gc_module["do_use"].__globals__
+    client = FakeCH(blocks=[[("object-a", 10, "time"), ("object-b", 20, "time")]])
 
-    def test_delete_batches_are_checkpointed_independently(self):
-        module = load_s3gc()
-        namespace = module["do_use"].__globals__
-        namespace["args"] = use_args(deletebatchsize=1)
-        namespace["ch_client"] = FakeCH(
-            blocks=[[("object-a", 10, "time"), ("object-b", 20, "time")]]
-        )
+    class SuccessfulMinio:
+        def remove_objects(self, bucket, objects):
+            return iter(())
 
-        class SuccessfulMinio:
-            def remove_objects(self, bucket, objects):
-                return iter(())
+    monkeypatch.setitem(namespace, "args", args_factory(deletebatchsize=1))
+    monkeypatch.setitem(namespace, "ch_client", client)
+    monkeypatch.setitem(namespace, "minio_client", SuccessfulMinio())
+    s3gc_module["do_use"]()
 
+    assert [insert[1] for insert in client.inserts] == [
+        [["object-a", 10, "time", False]],
+        [["object-b", 20, "time", False]],
+    ]
+
+
+def test_delete_entrypoint_requires_confirmation():
+    result = subprocess.run(
+        ["sh", str(ROOT / "docker/kubernetes-entrypoint.sh")],
+        env={
+            **os.environ,
+            "S3GC_PHASE": "delete",
+            "S3GC_CLUSTERNAME": "cluster",
+            "S3GC_EXPECTED_REPLICAS": "2",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 64
+    assert "Refusing delete" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("replacement", "message"),
+    [
+        (("PHASE=dry-run", "PHASE=delete"), "delete requires"),
+        (("ORDER_BY_OBJPATH=false", "ORDER_BY_OBJPATH=yes"), "ORDER_BY_OBJPATH"),
+    ],
+)
+def test_renderer_rejects_invalid_configuration(tmp_path, replacement, message):
+    source = (ROOT / "deploy/kubernetes/example.env").read_text()
+    config_path = tmp_path / "invalid.env"
+    config_path.write_text(source.replace(*replacement))
+
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "deploy/kubernetes/render.py"), config_path],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 64
+    assert message in result.stderr
+
+
+def test_kubernetes_default_antijoin_does_not_globally_sort(
+    s3gc_module, args_factory, monkeypatch
+):
+    namespace = s3gc_module["do_use"].__globals__
+    client = FakeCH()
+    monkeypatch.setitem(namespace, "args", args_factory(dryrun_flag=True))
+    monkeypatch.setitem(namespace, "ch_client", client)
+
+    s3gc_module["do_use"]()
+
+    assert "ORDER BY s3o.objpath" not in client.stream_query
+
+
+def test_antijoin_ordering_is_an_explicit_opt_in(s3gc_module, args_factory, monkeypatch):
+    namespace = s3gc_module["do_use"].__globals__
+    client = FakeCH()
+    monkeypatch.setitem(
+        namespace, "args", args_factory(dryrun_flag=True, order_by_objpath=True)
+    )
+    monkeypatch.setitem(namespace, "ch_client", client)
+
+    s3gc_module["do_use"]()
+
+    assert "ORDER BY s3o.objpath" in client.stream_query
+
+
+def test_delete_transport_failure_reconnects_once(
+    s3gc_module, args_factory, monkeypatch
+):
+    namespace = s3gc_module["remove_objects_reconnecting"].__globals__
+    attempts = []
+
+    class TransportFailingMinio:
+        def remove_objects(self, bucket, objects):
+            attempts.append("failed")
+            raise s3gc_module["urllib3"].exceptions.ReadTimeoutError(
+                None, "https://s3.example", "timed out"
+            )
+
+    class SuccessfulMinio:
+        def remove_objects(self, bucket, objects):
+            attempts.append("success")
+            return iter(())
+
+    def reconnect():
         namespace["minio_client"] = SuccessfulMinio()
-        module["do_use"]()
 
-        self.assertEqual(len(namespace["ch_client"].inserts), 2)
-        self.assertEqual(namespace["ch_client"].inserts[0][1], [["object-a", 10, "time", False]])
-        self.assertEqual(namespace["ch_client"].inserts[1][1], [["object-b", 20, "time", False]])
+    monkeypatch.setitem(namespace, "args", args_factory())
+    monkeypatch.setitem(namespace, "minio_client", TransportFailingMinio())
+    monkeypatch.setitem(namespace, "connect_to_s3", reconnect)
 
-    def test_delete_entrypoint_requires_confirmation(self):
-        result = subprocess.run(
-            ["sh", str(ROOT / "kubernetes-entrypoint.sh")],
-            env={
-                **os.environ,
-                "S3GC_PHASE": "delete",
-                "S3GC_CLUSTERNAME": "cluster",
-                "S3GC_EXPECTED_REPLICAS": "2",
-            },
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertEqual(result.returncode, 64)
-        self.assertIn("Refusing delete", result.stderr)
-
-    def test_render_rejects_unacknowledged_delete(self):
-        source = (ROOT / "deploy/kubernetes/example.env").read_text()
-        with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as config:
-            config.write(source.replace("PHASE=dry-run", "PHASE=delete"))
-            config_path = config.name
-        self.addCleanup(lambda: os.unlink(config_path))
-
-        result = subprocess.run(
-            [sys.executable, str(ROOT / "deploy/kubernetes/render.py"), config_path],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertEqual(result.returncode, 64)
-        self.assertIn("delete requires", result.stderr)
-
-
-if __name__ == "__main__":
-    unittest.main()
+    assert s3gc_module["remove_objects_reconnecting"]([("object-a", 10, "time")]) == []
+    assert attempts == ["failed", "success"]

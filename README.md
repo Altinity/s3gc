@@ -1,6 +1,31 @@
 # s3gc
 Garbage collector for ClickHouse S3 disks
 
+## Repository layout
+
+- `s3gc.py` — collector and deletion logic.
+- `docker/` — reproducible Python 3.11 container packaging.
+- `deploy/kubernetes/` — generic one-shot Kubernetes Job renderer and operator runbook.
+- `tests/` — safety and renderer unit tests.
+
+The repository is intentionally public and contains no target-cluster details,
+credentials, rendered manifests, or environment configuration. Operators keep
+those values outside Git and deploy an image pinned by digest.
+
+## Testing
+
+Install test-only dependencies with
+`uv pip install --python .venv/bin/python -r requirements-dev.txt`, then run
+the isolated unit suite with:
+
+```
+.venv/bin/python -m pytest -v
+```
+
+Tests marked `dev_cluster` require the dedicated development Kubernetes cluster
+and are never run by CI. They must be selected explicitly with
+`pytest -m dev_cluster` after reviewing their fixture scope.
+
 ## description
 The script removes orphaned objects from s3 object storage
   Ones that are not mentioned in system.remote_data_paths table
@@ -72,22 +97,19 @@ S3GC_S3PORT=19000  S3GC_S3ACCESSKEY=minio99  S3GC_S3SECRETKEY=minio123 S3GC_USEC
 ## docker
 There is a docker image for the script.
 
-The published image is pinned to Python 3.11 for reproducibility.
-
-When regenerating the Dockerfile defaults, run `make` with an interpreter that
-has the pinned requirements installed, for example
-`make PYTHON=.venv/bin/python`.
+Development, CI, and the image use Python 3.11. With `uv` installed, create the
+local environment with `uv venv --python 3.11 .venv`, then install the pinned
+requirements with `uv pip install --python .venv/bin/python -r requirements.txt`.
 
 ### rebuild
 ```
-make
-sudo docker buildx build --platform linux/arm/v7,linux/arm64/v8,linux/amd64 -t altinity/s3gc .
+docker buildx build --platform linux/amd64,linux/arm64 -f docker/Dockerfile -t altinity/s3gc .
 ```
 
 ### usage
 ```
-sudo docker run altinity/s3gc --help
-sudo docker run --network="host" -e S3GC_S3PORT=19000 -e S3GC_S3ACCESSKEY=minio99 -e S3GC_S3SECRETKEY=minio123 altinity/s3gc
+docker run altinity/s3gc --help
+docker run --network="host" -e S3GC_S3PORT=19000 -e S3GC_S3ACCESSKEY=minio99 -e S3GC_S3SECRETKEY=minio123 altinity/s3gc
 ```
 
 ## Kubernetes
@@ -97,6 +119,10 @@ the collector inside the ClickHouse namespace. It has separate `collect`,
 `dry-run`, and guarded `delete` phases and does not create or contain secrets.
 See [deploy/kubernetes/README.md](deploy/kubernetes/README.md) for the render
 contract and safety requirements.
+
+Images are published only by the GitHub Actions workflow after a trusted push to
+protected `master`. Pull requests run tests without registry credentials and do
+not publish an image.
 
 ## changelog
 

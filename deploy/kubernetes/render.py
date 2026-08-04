@@ -24,6 +24,7 @@ REQUIRED = {
     "MEMORY_LIMIT",
     "MEMORY_REQUEST",
     "NAMESPACE",
+    "ORDER_BY_OBJPATH",
     "PHASE",
     "S3BUCKET",
     "S3DISKNAME",
@@ -84,6 +85,8 @@ def validate(values: dict[str, str]) -> None:
         raise ValueError("S3USEIAM must be true or false")
     if values["VERBOSE"] not in {"true", "false"}:
         raise ValueError("VERBOSE must be true or false")
+    if values["ORDER_BY_OBJPATH"] not in {"true", "false"}:
+        raise ValueError("ORDER_BY_OBJPATH must be true or false")
 
 
 def main() -> int:

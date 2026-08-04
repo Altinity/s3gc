@@ -30,4 +30,4 @@ case "${phase}" in
     ;;
 esac
 
-exec python ./s3gc.py "$@"
+exec python /app/s3gc.py "$@"

@@ -33,7 +33,7 @@ spec:
         - name: s3gc
           image: "${IMAGE}"
           imagePullPolicy: IfNotPresent
-          command: ["/usr/src/app/kubernetes-entrypoint.sh"]
+          command: ["/app/kubernetes-entrypoint.sh"]
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -86,6 +86,8 @@ spec:
               value: "${DELETE_BATCH_SIZE}"
             - name: S3GC_USEAGE
               value: "${USEAGE_HOURS}"
+            - name: S3GC_ORDER_BY_OBJPATH
+              value: "${ORDER_BY_OBJPATH}"
             - name: S3GC_CHTIMEOUT
               value: "${ACTIVE_DEADLINE_SECONDS}"
             - name: S3GC_VERBOSE_FLAG

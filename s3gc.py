@@ -20,6 +20,7 @@ from io import StringIO
 from minio import Minio
 from minio.deleteobjects import DeleteObject
 from minio.credentials import IamAwsProvider
+from minio.error import S3Error
 from contextlib import redirect_stdout
 import clickhouse_connect
 
@@ -317,6 +318,41 @@ parser.add_argument(
     help="S3 objects to delete and checkpoint per progress batch",
 )
 parser.add_argument(
+    "--order-by-objpath",
+    action="store_true",
+    dest="order_by_objpath",
+    default=False,
+    help="Order anti-join output by object path (costly for large Kubernetes Jobs)",
+)
+parser.add_argument(
+    "--order-by-objpath-flag",
+    dest="order_by_objpath",
+    type=bool,
+    default=False,
+    help="Order anti-join output by object path (costly for large Kubernetes Jobs)",
+)
+parser.add_argument(
+    "--s3-connect-timeout",
+    dest="s3_connect_timeout",
+    type=int,
+    default=15,
+    help="S3 connection timeout in seconds",
+)
+parser.add_argument(
+    "--s3-read-timeout",
+    dest="s3_read_timeout",
+    type=int,
+    default=120,
+    help="S3 read timeout in seconds",
+)
+parser.add_argument(
+    "--s3-retries",
+    dest="s3_retries",
+    type=int,
+    default=3,
+    help="S3 HTTP retries for transient failures",
+)
+parser.add_argument(
     "--chtimeout",
     "--ch-timeout",
     "--send-receive-timeout",
@@ -599,7 +635,21 @@ def connect_to_s3():
     connection_options = {
         "secure": args.s3secure_flag,
         "region": args.s3region,
-        "http_client": urllib3.PoolManager(cert_reqs="CERT_NONE"),
+        "http_client": urllib3.PoolManager(
+            cert_reqs="CERT_NONE",
+            timeout=urllib3.Timeout(
+                connect=args.s3_connect_timeout, read=args.s3_read_timeout
+            ),
+            retries=urllib3.Retry(
+                total=args.s3_retries,
+                connect=args.s3_retries,
+                read=args.s3_retries,
+                status=args.s3_retries,
+                backoff_factor=1,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=frozenset({"DELETE", "GET", "HEAD", "POST"}),
+            ),
+        ),
     }
     if args.s3useiam:
         connection_options["credentials"] = IamAwsProvider()
@@ -610,6 +660,30 @@ def connect_to_s3():
         f"{args.s3ip}:{args.s3port}",
         **connection_options,
     )
+
+
+def remove_objects_reconnecting(batch_rows):
+    """Delete one batch, reconnecting once if the S3 transport is stale.
+
+    DeleteObject requests are idempotent: retrying after an interrupted response
+    can only leave the object absent, never delete a different object.
+    """
+    for attempt in range(2):
+        try:
+            return list(
+                minio_client.remove_objects(
+                    args.s3bucket, [DeleteObject(row[0]) for row in batch_rows]
+                )
+            )
+        except (S3Error, urllib3.exceptions.HTTPError) as exc:
+            if attempt:
+                raise
+            logger.warning(
+                "S3 delete transport failed (%s); reconnecting and retrying once", exc
+            )
+            connect_to_s3()
+
+    raise AssertionError("unreachable")
 
 
 def do_collect():
@@ -704,11 +778,12 @@ def do_use():
         if not calc_only:
             sample_condition = f"CRC32(s3o.objpath) % {args.samples} = {sample} AND "
 
+        order_by = " ORDER BY s3o.objpath" if args.order_by_objpath else ""
         antijoin = f"""
         SELECT s3o.objpath, s3o.size as size, s3o.last_modified as last_modified FROM {tname} AS s3o LEFT ANTI JOIN {srdp} AS rdp ON
         (rdp.remote_path = s3o.objpath AND rdp.disk_name='{args.s3diskname}')
         WHERE {sample_condition} s3o.active=true {after_condition} {age_condition}
-        ORDER BY s3o.objpath {limit} SETTINGS final = 1"""
+        {order_by} {limit} SETTINGS final = 1"""
 
         if calc_only:
             countantijoin = f"SELECT COUNT(1), SUM(size) FROM ({antijoin}) q"
@@ -768,9 +843,7 @@ def do_use():
                     batch_rows = selected_rows[offset : offset + args.deletebatchsize]
                     errors = []
                     if args.use_remove_objects:
-                        errors = list(minio_client.remove_objects(
-                            args.s3bucket, [DeleteObject(row[0]) for row in batch_rows]
-                        ))
+                        errors = remove_objects_reconnecting(batch_rows)
                         for error in errors:
                             logger.info(f"error occurred when deleting object via remove_objects {error}")
 

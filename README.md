@@ -116,7 +116,8 @@ docker run --network="host" -e S3GC_S3PORT=19000 -e S3GC_S3ACCESSKEY=minio99 -e 
 
 `deploy/kubernetes/` contains a plain-template one-shot Job runner for running
 the collector inside the ClickHouse namespace. It has separate `collect`,
-`dry-run`, and guarded `delete` phases and does not create or contain secrets.
+`dry-run`, and guarded `delete` phases, plus a guarded `dev-automation` phase
+for non-production testing, and does not create or contain secrets.
 See [deploy/kubernetes/README.md](deploy/kubernetes/README.md) for the render
 contract and safety requirements.
 

@@ -159,10 +159,77 @@ def test_delete_entrypoint_requires_confirmation():
     assert "Refusing delete" in result.stderr
 
 
+def test_dev_automation_entrypoint_runs_collect_dry_run_and_delete(tmp_path):
+    calls_path = tmp_path / "calls"
+    fake_python = tmp_path / "python"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >> \"$CALLS_PATH\"\n"
+    )
+    fake_python.chmod(0o755)
+
+    result = subprocess.run(
+        ["sh", str(ROOT / "docker/kubernetes-entrypoint.sh")],
+        env={
+            **os.environ,
+            "PATH": f"{tmp_path}:{os.environ['PATH']}",
+            "CALLS_PATH": str(calls_path),
+            "S3GC_PHASE": "dev-automation",
+            "S3GC_DELETE_CONFIRMATION": "DELETE_ORPHANS",
+            "S3GC_CLUSTERNAME": "cluster",
+            "S3GC_EXPECTED_REPLICAS": "2",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert calls_path.read_text().splitlines() == [
+        "/app/s3gc.py --collectonly --keepdata --drop-collecttable",
+        "/app/s3gc.py --usecollected --dry-run",
+        "/app/s3gc.py --usecollected --keepdata --non-interactive",
+    ]
+
+
+def test_dev_automation_entrypoint_stops_after_an_error(tmp_path):
+    calls_path = tmp_path / "calls"
+    fake_python = tmp_path / "python"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >> \"$CALLS_PATH\"\n"
+        "case \"$*\" in *--dry-run) exit 42 ;; esac\n"
+    )
+    fake_python.chmod(0o755)
+
+    result = subprocess.run(
+        ["sh", str(ROOT / "docker/kubernetes-entrypoint.sh")],
+        env={
+            **os.environ,
+            "PATH": f"{tmp_path}:{os.environ['PATH']}",
+            "CALLS_PATH": str(calls_path),
+            "S3GC_PHASE": "dev-automation",
+            "S3GC_DELETE_CONFIRMATION": "DELETE_ORPHANS",
+            "S3GC_CLUSTERNAME": "cluster",
+            "S3GC_EXPECTED_REPLICAS": "2",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 42
+    assert calls_path.read_text().splitlines() == [
+        "/app/s3gc.py --collectonly --keepdata --drop-collecttable",
+        "/app/s3gc.py --usecollected --dry-run",
+    ]
+
+
 @pytest.mark.parametrize(
     ("replacement", "message"),
     [
         (("PHASE=dry-run", "PHASE=delete"), "delete requires"),
+        (("PHASE=dry-run", "PHASE=dev-automation"), "dev-automation requires"),
         (("ORDER_BY_OBJPATH=false", "ORDER_BY_OBJPATH=yes"), "ORDER_BY_OBJPATH"),
     ],
 )
@@ -180,6 +247,26 @@ def test_renderer_rejects_invalid_configuration(tmp_path, replacement, message):
 
     assert result.returncode == 64
     assert message in result.stderr
+
+
+def test_renderer_accepts_confirmed_dev_automation(tmp_path):
+    source = (ROOT / "deploy/kubernetes/example.env").read_text()
+    config_path = tmp_path / "dev-automation.env"
+    config_path.write_text(
+        source.replace("PHASE=dry-run", "PHASE=dev-automation").replace(
+            "DELETE_CONFIRMATION=", "DELETE_CONFIRMATION=DELETE_ORPHANS"
+        )
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "deploy/kubernetes/render.py"), config_path],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert 's3gc.altinity.com/phase: "dev-automation"' in result.stdout
 
 
 def test_kubernetes_default_antijoin_does_not_globally_sort(

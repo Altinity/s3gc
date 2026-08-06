@@ -166,6 +166,19 @@ Changes below are on `feature/kubernetes-job-runner` and not yet released.
 
 ### Migration notes
 
+- **Saved rendering env files must be updated: `S3USEIAM` → `S3AUTH` (+ `S3PROFILE`).**
+  `job.yaml.tmpl` no longer emits `S3GC_S3USEIAM`, and `render.py` now *requires*
+  `S3AUTH` and `S3PROFILE`, so an env file kept from before this change fails with:
+
+  ```
+  render error: missing required values: S3AUTH, S3PROFILE
+  ```
+
+  Replace `S3USEIAM=true` with `S3AUTH=iam`, or `S3USEIAM=false` with `S3AUTH=static`,
+  and add an empty `S3PROFILE=`. Note this only affects the **rendering** env file;
+  the `S3GC_S3USEIAM` *environment variable* is still honoured by the script itself as
+  a deprecated alias, so a Job manifest already deployed keeps working.
+
 - **Pull secrets are registry-scoped.** Moving from Docker Hub to GHCR silently
   invalidates an existing `imagePullSecret` even though its *name* still looks
   right: a secret holding `index.docker.io` credentials does not apply to
@@ -185,6 +198,17 @@ Changes below are on `feature/kubernetes-job-runner` and not yet released.
   change they get what they asked for. No action is needed unless a deployment
   was relying on the broken behaviour to reach IAM, in which case set it to
   `true` explicitly.
+
+### Verified
+
+All three phases were exercised end to end against a development ClickHouse cluster using the
+image built from this branch, pulled anonymously from the public registry with no
+`imagePullSecret`: `collect` (188 objects), `dry-run` (exactly the 16 seeded orphan
+fixtures), `delete` (cluster preflight, per-batch checkpoints, cumulative total) and a
+verifying `dry-run` reporting zero. `auth=iam` in the log confirms workload identity still
+resolves after the credential-resolution rewrite, and the referenced tables were untouched.
+Unit tests cover the `static`/`aws` modes; the GCS per-object fallback is still only
+unit-tested, pending a real GCS endpoint.
 
 ### Known gaps
 

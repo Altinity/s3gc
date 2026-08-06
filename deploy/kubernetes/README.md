@@ -30,15 +30,29 @@ needed.
   not schedule there.
 - Create or reuse a namespace-local ServiceAccount.
 - Create a runtime Secret named by `CREDENTIALS_SECRET`:
-  - static S3: `S3GC_CHUSER`, `S3GC_CHPASS`, `S3GC_S3ACCESSKEY`, and
-    `S3GC_S3SECRETKEY`; set `S3USEIAM=false`.
-  - workload identity: only `S3GC_CHUSER` and `S3GC_CHPASS`; set
-    `S3USEIAM=true` and use an identity-enabled ServiceAccount. Note the
-    template sets `automountServiceAccountToken: false`, so IAM mode also needs
-    a ServiceAccount that actually projects a token.
+  - `S3AUTH=static`: `S3GC_CHUSER`, `S3GC_CHPASS`, `S3GC_S3ACCESSKEY`,
+    `S3GC_S3SECRETKEY`, plus `S3GC_S3SESSIONTOKEN` for temporary credentials.
+  - `S3AUTH=iam`: only `S3GC_CHUSER` and `S3GC_CHPASS`, with an
+    identity-enabled ServiceAccount. Note the template sets
+    `automountServiceAccountToken: false`, so `iam` also needs a ServiceAccount
+    that actually projects a token.
 - Confirm the ClickHouse Service name, cluster macro, expected replica count,
   S3 bucket/prefix, and disk name. Use a unique `COLLECTTABLEPREFIX` per
   bucket/prefix cleanup.
+
+### Choosing `S3AUTH`
+
+| `S3AUTH` | Credentials | Needs boto3 | Use when |
+|---|---|---|---|
+| `iam` (default here) | MinIO workload identity — IRSA, IMDS, ECS task role | no | the normal Kubernetes case |
+| `static` | `S3GC_S3ACCESSKEY`/`S3GC_S3SECRETKEY` (+ optional `S3GC_S3SESSIONTOKEN`) from the Secret | no | no workload identity available |
+| `aws` | boto3 chain, optionally `S3PROFILE` | **yes** | rarely in-cluster; this is a workstation SSO path |
+
+`S3PROFILE` requires `S3AUTH=aws` and the renderer rejects other combinations.
+`S3GC_S3USEIAM=true` still works as a deprecated alias for `S3AUTH=iam`.
+
+Prefer `iam`: it hands MinIO the credential provider, so temporary credentials
+refresh during a long collect or delete instead of expiring mid-run.
 
 ### Minimum ClickHouse grants
 

@@ -33,7 +33,8 @@ REQUIRED = {
     "S3PORT",
     "S3REGION",
     "S3SECURE_FLAG",
-    "S3USEIAM",
+    "S3AUTH",
+    "S3PROFILE",
     "SAMPLES",
     "SERVICE_ACCOUNT",
     "TTL_SECONDS_AFTER_FINISHED",
@@ -81,8 +82,10 @@ def validate(values: dict[str, str]) -> None:
             raise ValueError(f"{numeric_key} must be a positive integer")
     if not values["USEAGE_HOURS"].isdigit() or int(values["USEAGE_HOURS"]) < 0:
         raise ValueError("USEAGE_HOURS must be a non-negative integer")
-    if values["S3USEIAM"] not in {"true", "false"}:
-        raise ValueError("S3USEIAM must be true or false")
+    if values["S3AUTH"] not in {"static", "aws", "iam"}:
+        raise ValueError("S3AUTH must be static, aws or iam")
+    if values["S3PROFILE"] and values["S3AUTH"] != "aws":
+        raise ValueError("S3PROFILE requires S3AUTH=aws")
     if values["VERBOSE"] not in {"true", "false"}:
         raise ValueError("VERBOSE must be true or false")
     if values["ORDER_BY_OBJPATH"] not in {"true", "false"}:

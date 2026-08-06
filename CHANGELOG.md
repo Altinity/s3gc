@@ -61,6 +61,44 @@ Changes below are on `feature/kubernetes-job-runner` and not yet released.
 
 ### Added
 
+- **S3 authentication modes — `--s3auth=static|aws|iam`**, merging
+  [PR #2](https://github.com/Altinity/s3gc/pull/2) by **@realyota**, which added
+  `--s3auth=aws`, `--s3profile` and `--s3-session-token` so credentials can come from
+  the boto3 chain (AWS SSO profiles) or as explicit temporary credentials.
+
+  That PR replaced the workload-identity path outright. Both are kept instead,
+  because they are not interchangeable: `iam` uses MinIO's own provider, needs no
+  `boto3`, and is what the validated Kubernetes deployments use — it hands MinIO the
+  *provider* rather than frozen keys so credentials refresh across a long collect or
+  delete. `aws` resolves through boto3 and suits a workstation with SSO.
+
+  | Mode | Credentials | boto3 |
+  |---|---|---|
+  | `static` (default) | explicit keys, optional session token | no |
+  | `aws` | boto3 chain / `--s3profile` | **yes** |
+  | `iam` | MinIO workload identity (IRSA/IMDS/ECS) | no |
+
+  `--s3profile` implies `aws`; **`--s3useiam` is now a deprecated alias for
+  `--s3auth=iam`** and still works, with a warning — every existing manifest and
+  Secret keeps working unchanged. Contradictory combinations are rejected rather than
+  silently resolved, so nobody ends up authenticating with an identity they did not
+  ask for.
+
+- **Operator-facing S3 listing errors**, also from PR #2: a failed listing now names
+  the required permission (`s3:ListBucket` on the bucket ARN, **even for
+  `--dry-run`**) and prints the `aws sts get-caller-identity` /
+  `aws s3api list-objects-v2` commands to verify the same credentials. `UserVisibleError`
+  reports such failures without a traceback.
+
+- **Wider log-secret filtering** (PR #2): `s3accesskey` and `s3sessiontoken` are now
+  redacted alongside `chpass` and `s3secretkey`.
+
+- **Kubernetes wiring for the new auth**, which PR #2 did not include: `S3AUTH` and
+  `S3PROFILE` are exposed by `job.yaml.tmpl`, required and validated by `render.py`
+  (`S3PROFILE` without `S3AUTH=aws` is an error), and default to `iam` in
+  `example.env`. Without this the flags were unreachable from a Job. The session token
+  stays out of the non-secret env file — it belongs in the credentials Secret.
+
 - **Warning when `--samples` disagrees with the auxiliary table's
   `PARTITION BY`.** The table is created as `PARTITION BY CRC32(objpath) %
   <samples>` at collect time, so a different value during the use phase loses
@@ -87,6 +125,11 @@ Changes below are on `feature/kubernetes-job-runner` and not yet released.
   copy a registry credential into the target namespace as an `imagePullSecret`
   and remember to delete it afterwards. A public image removes that step
   entirely.
+
+- **`boto3` is a pinned runtime dependency** (`boto3==1.43.65`), required by
+  `--s3auth=aws`. It is imported lazily, so the other modes never load it. PR #2 added
+  it unpinned; the pinned set is kept per `CLAUDE.md` rule 5 — unpinned `jsonargparse`
+  resolves to 4.50.x and fails at import.
 
 - **`IMAGE_PULL_SECRET` is now optional.** `render.py` omits the
   `imagePullSecrets` block when the value is empty, rather than emitting a

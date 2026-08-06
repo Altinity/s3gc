@@ -95,16 +95,77 @@ export S3GC_S3SECRETKEY='<s3-secret-key>'
 export S3GC_S3USEIAM=false
 ```
 
-For an identity-enabled environment such as EKS/IRSA, do not set static S3
-keys; use the workload identity available to the process instead:
+Every `S3GC_*` boolean accepts `true/false`, `yes/no`, `on/off`, `1/0`, or an
+empty value for false. Unset also means false.
+
+### S3 authentication modes
+
+Select one with `S3GC_S3AUTH` (or `--s3auth`):
+
+| Mode | Credentials | Needs boto3 | Typical use |
+|---|---|---|---|
+| `static` (default) | `S3GC_S3ACCESSKEY` + `S3GC_S3SECRETKEY`, optionally `S3GC_S3SESSIONTOKEN` | no | long-lived keys, or explicit temporary credentials |
+| `aws` | boto3 credential chain, optionally `S3GC_S3PROFILE` | **yes** | AWS SSO / named profiles on a workstation |
+| `iam` | MinIO workload identity provider | no | EKS IRSA, EC2 instance profile, ECS task role |
+
+`S3GC_S3PROFILE` implies `aws`. `S3GC_S3USEIAM=true` is a **deprecated alias**
+for `S3GC_S3AUTH=iam` — it still works and logs a deprecation warning.
+Contradictory combinations are rejected rather than silently resolved.
+
+Prefer `iam` over `aws` inside Kubernetes: it refreshes temporary credentials
+through MinIO's provider and keeps `boto3` out of the request path.
+
+#### AWS SSO or a named profile
+
+Authenticate with the AWS CLI first, then let `s3gc` resolve temporary
+credentials through the boto3 chain:
+
+```bash
+aws sso login --profile my-sso-profile
+
+export S3GC_S3AUTH=aws
+export S3GC_S3PROFILE=my-sso-profile
+export S3GC_S3IP=s3.amazonaws.com
+export S3GC_S3PORT=443
+export S3GC_S3REGION=us-east-1
+export S3GC_S3SECURE_FLAG=true
+.venv/bin/python ./s3gc.py --verbose --dry-run
+```
+
+`S3GC_S3ACCESSKEY` and `S3GC_S3SECRETKEY` are unused in `aws` mode, and setting
+them is an error rather than a silent override. The resolved credentials must
+allow `s3:ListBucket` on the bucket for that prefix **even for `--dry-run`** —
+collection lists objects. On failure `s3gc` prints the required permission and
+the commands to verify it:
+
+```bash
+aws sts get-caller-identity --profile my-sso-profile
+aws s3api list-objects-v2 --bucket <bucket> --prefix <prefix> --max-keys 1 --profile my-sso-profile
+```
+
+#### Workload identity (EKS/IRSA, EC2, ECS)
 
 ```bash
 export S3GC_CHPASS='<clickhouse-password>'
-export S3GC_S3USEIAM=true
+export S3GC_S3AUTH=iam        # or the deprecated S3GC_S3USEIAM=true
 ```
 
-Every `S3GC_*` boolean accepts `true/false`, `yes/no`, `on/off`, `1/0`, or an
-empty value for false. Unset also means false.
+#### GCS and other stores without batch delete
+
+GCS has no batch `DeleteObjects`. `s3gc` detects a `storage.googleapis.com`
+endpoint and falls back to per-object deletion automatically, warning that it is
+slower; `--use-remove-objects=false` sets it explicitly. Note the disk name is
+usually `gcs`, not `s3`, and GCS needs **HMAC/interop** keys:
+
+```bash
+export S3GC_S3ACCESSKEY='GOOG1...'
+export S3GC_S3SECRETKEY='...'
+export S3GC_S3IP=storage.googleapis.com
+export S3GC_S3PORT=443
+export S3GC_S3SECURE_FLAG=true
+export S3GC_S3DISKNAME=gcs
+.venv/bin/python ./s3gc.py --verbose --use-remove-objects=false
+```
 
 ### Collect has no resume — shard large buckets
 

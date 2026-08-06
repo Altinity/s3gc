@@ -83,6 +83,14 @@ def args_factory():
             "s3bucket": "bucket",
             "keepdata_flag": True,
             "silent_flag": True,
+            # S3 auth surface (static | aws | iam)
+            "s3auth": "static",
+            "s3profile": "",
+            "s3useiam": False,
+            "s3accesskey": "",
+            "s3secretkey": "",
+            "s3sessiontoken": "",
+            "s3region": "eu-central-1",
         }
         values.update(overrides)
         return types.SimpleNamespace(**values)
@@ -576,3 +584,191 @@ def test_renderer_keeps_configured_image_pull_secret(tmp_path):
     assert result.returncode == 0
     assert "imagePullSecrets:" in result.stdout
     assert "- name: \"my-mirror-pull\"" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# S3 authentication modes (merged from Altinity/s3gc PR #2, unified with iam).
+# ---------------------------------------------------------------------------
+
+
+def _resolve(s3gc_module, monkeypatch, **overrides):
+    namespace = s3gc_module["resolve_s3_credentials"].__globals__
+    args = types.SimpleNamespace(
+        s3auth="static", s3profile="", s3useiam=False,
+        s3accesskey="", s3secretkey="", s3sessiontoken="", s3region="eu-central-1",
+    )
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    monkeypatch.setitem(namespace, "args", args)
+    return s3gc_module["resolve_s3_credentials"]()
+
+
+def test_static_mode_returns_supplied_keys(s3gc_module, monkeypatch):
+    result = _resolve(s3gc_module, monkeypatch, s3accesskey="AK", s3secretkey="SK")
+    assert result[0] == "AK" and result[1] == "SK"
+    assert result[2] is None          # no session token
+    assert result[4] == "static"
+
+
+def test_static_mode_carries_session_token(s3gc_module, monkeypatch):
+    result = _resolve(
+        s3gc_module, monkeypatch, s3accesskey="AK", s3secretkey="SK", s3sessiontoken="TOKEN"
+    )
+    assert result[2] == "TOKEN"
+
+
+def test_static_mode_without_keys_is_anonymous(s3gc_module, monkeypatch):
+    assert _resolve(s3gc_module, monkeypatch)[4] == "anonymous"
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"s3accesskey": "AK"}, "must be specified together"),
+        ({"s3secretkey": "SK"}, "must be specified together"),
+        ({"s3sessiontoken": "TOKEN"}, "requires s3accesskey"),
+    ],
+)
+def test_static_mode_rejects_incomplete_credentials(s3gc_module, monkeypatch, overrides, message):
+    with pytest.raises(ValueError, match=message):
+        _resolve(s3gc_module, monkeypatch, **overrides)
+
+
+def test_iam_mode_defers_to_the_provider(s3gc_module, monkeypatch):
+    """iam returns no keys: MinIO gets the provider so it can refresh them."""
+    result = _resolve(s3gc_module, monkeypatch, s3auth="iam")
+    assert result[:3] == (None, None, None)
+    assert result[4] == "iam"
+
+
+def test_s3useiam_is_a_deprecated_alias_for_iam(s3gc_module, monkeypatch, caplog):
+    """Every validated Kubernetes deployment sets S3GC_S3USEIAM=true."""
+    with caplog.at_level("WARNING"):
+        result = _resolve(s3gc_module, monkeypatch, s3useiam=True)
+    assert result[4] == "iam"
+    assert "deprecated" in caplog.text
+
+
+def test_s3profile_implies_aws_mode(s3gc_module, monkeypatch):
+    calls = []
+    namespace = s3gc_module["resolve_s3_credentials"].__globals__
+    monkeypatch.setitem(
+        namespace, "resolve_aws_s3_credentials",
+        lambda: calls.append("aws") or (None, None, None, "eu-central-1", "aws"),
+    )
+    assert _resolve(s3gc_module, monkeypatch, s3profile="sso")[4] == "aws"
+    assert calls == ["aws"]
+
+
+def test_unknown_auth_mode_is_rejected(s3gc_module, monkeypatch):
+    with pytest.raises(ValueError, match="s3auth must be one of"):
+        _resolve(s3gc_module, monkeypatch, s3auth="magic")
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"s3auth": "iam", "s3profile": "sso"},      # profile implies aws, conflicts with iam
+        {"s3auth": "aws", "s3useiam": True},        # s3useiam implies iam, conflicts with aws
+    ],
+)
+def test_contradictory_auth_settings_error(s3gc_module, monkeypatch, overrides):
+    """A contradiction must fail, not silently pick a winner and send the wrong identity."""
+    with pytest.raises(ValueError, match="conflicts with"):
+        _resolve(s3gc_module, monkeypatch, **overrides)
+
+
+def test_aws_mode_rejects_explicit_keys(s3gc_module, monkeypatch):
+    with pytest.raises(ValueError, match="cannot be combined with explicit"):
+        _resolve(s3gc_module, monkeypatch, s3auth="aws", s3accesskey="AK", s3secretkey="SK")
+
+
+def test_aws_mode_without_boto3_is_user_visible(s3gc_module, monkeypatch):
+    """A missing optional dependency must not surface as a bare ImportError."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *rest):
+        if name == "boto3":
+            raise ImportError("no boto3")
+        return real_import(name, *rest)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    with pytest.raises(s3gc_module["UserVisibleError"], match="boto3 is required"):
+        _resolve(s3gc_module, monkeypatch, s3auth="aws")
+
+
+def test_format_s3_list_error_names_the_permission(s3gc_module, args_factory, monkeypatch):
+    """The listing failure must tell the operator exactly what to grant."""
+    namespace = s3gc_module["format_s3_list_error"].__globals__
+    monkeypatch.setitem(
+        namespace, "args", args_factory(s3bucket="my-bucket", s3path="pre/fix/", s3profile="sso")
+    )
+
+    class Err:
+        code = "AccessDenied"
+        message = "denied"
+
+    text = s3gc_module["format_s3_list_error"](Err())
+    assert "s3:ListBucket" in text
+    assert "my-bucket" in text and "pre/fix/" in text
+    assert "even with --dry-run" in text
+    assert "--profile sso" in text
+
+
+def test_iam_mode_keeps_the_hardened_transport(s3gc_module, args_factory, monkeypatch):
+    """The merge must not revert to a bare PoolManager: that hung a run for 2h19m."""
+    namespace = s3gc_module["connect_to_s3"].__globals__
+    captured = {}
+    monkeypatch.setitem(namespace, "Minio", lambda endpoint, **kw: captured.update(kw) or object())
+    monkeypatch.setitem(
+        namespace, "args",
+        args_factory(s3auth="iam", s3ip="s3.eu-central-1.amazonaws.com", s3port=443,
+                     s3secure_flag=True, s3sslcertfile="", s3_connect_timeout=15,
+                     s3_read_timeout=120, s3_retries=3),
+    )
+    s3gc_module["connect_to_s3"]()
+
+    assert "credentials" in captured            # provider, not frozen keys
+    assert "access_key" not in captured
+    timeout = captured["http_client"].connection_pool_kw["timeout"]
+    assert timeout.read_timeout == 120 and timeout.connect_timeout == 15
+
+
+@pytest.mark.parametrize(
+    ("replacement", "message"),
+    [
+        (("S3AUTH=iam", "S3AUTH=magic"), "S3AUTH must be static, aws or iam"),
+        (("S3PROFILE=", "S3PROFILE=sso"), "S3PROFILE requires S3AUTH=aws"),
+    ],
+)
+def test_renderer_validates_auth_configuration(tmp_path, replacement, message):
+    source = (ROOT / "deploy/kubernetes/example.env").read_text()
+    config_path = tmp_path / "auth.env"
+    config_path.write_text(source.replace(*replacement))
+
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "deploy/kubernetes/render.py"), config_path],
+        capture_output=True, text=True, check=False,
+    )
+
+    assert result.returncode == 64
+    assert message in result.stderr
+
+
+def test_renderer_wires_auth_env_into_the_job(tmp_path):
+    """PR #2's flags were unreachable from a Job until the template exposed them."""
+    source = (ROOT / "deploy/kubernetes/example.env").read_text()
+    config_path = tmp_path / "aws.env"
+    config_path.write_text(source.replace("S3AUTH=iam", "S3AUTH=aws").replace("S3PROFILE=", "S3PROFILE=sso"))
+
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "deploy/kubernetes/render.py"), config_path],
+        capture_output=True, text=True, check=False,
+    )
+
+    assert result.returncode == 0
+    assert 'name: S3GC_S3AUTH' in result.stdout
+    assert 'value: "aws"' in result.stdout
+    assert 'value: "sso"' in result.stdout

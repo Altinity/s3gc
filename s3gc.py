@@ -131,6 +131,31 @@ parser.add_argument(
     help="S3 secret key",
 )
 parser.add_argument(
+    "--s3-session-token",
+    "--s3sessiontoken",
+    dest="s3sessiontoken",
+    default="",
+    help="S3 session token for explicit temporary credentials",
+)
+parser.add_argument(
+    "--s3auth",
+    "--s3-auth",
+    dest="s3auth",
+    default="static",
+    help=(
+        "S3 auth mode: static, aws or iam. static uses explicit keys (optionally with a "
+        "session token); aws uses the boto3 credential chain, including AWS SSO profiles; "
+        "iam uses MinIO's workload identity provider (IRSA/IMDS/ECS) and needs no boto3"
+    ),
+)
+parser.add_argument(
+    "--s3profile",
+    "--s3-profile",
+    dest="s3profile",
+    default="",
+    help="AWS profile name for S3 auth. Setting this enables aws auth mode",
+)
+parser.add_argument(
     "--s3secure",
     "--s3-secure",
     action="store_true",
@@ -173,7 +198,15 @@ parser.add_argument(
     action="store_true",
     dest="s3useiam",
     default=False,
-    help="Use the AWS SDK-compatible workload identity credential chain instead of static S3 keys",
+    help="DEPRECATED alias for --s3auth=iam. Use the workload identity credential chain",
+)
+parser.add_argument(
+    "--s3useiamflag",
+    "--s3-use-iam-flag",
+    type=coerce_bool,
+    dest="s3useiam",
+    default=False,
+    help="DEPRECATED alias for --s3auth=iam. Use the workload identity credential chain",
 )
 parser.add_argument(
     "--keepdata",
@@ -566,10 +599,14 @@ class LogFormatter(logging.Formatter):
 
     def get_filter_strings():
         filter_strings = []
-        if len(args.chpass) > 3:
-            filter_strings.append(args.chpass)
-        if len(args.s3secretkey) > 3:
-            filter_strings.append(args.s3secretkey)
+        for secret in [
+            args.chpass,
+            args.s3accesskey,
+            args.s3secretkey,
+            args.s3sessiontoken,
+        ]:
+            if len(secret) > 3:
+                filter_strings.append(secret)
         return filter_strings
 
     filter_strings = get_filter_strings()
@@ -659,6 +696,10 @@ def preflight_cluster():
     )
 
 
+class UserVisibleError(RuntimeError):
+    """An operator-facing failure: reported without a traceback."""
+
+
 def connect_to_ch():
     logger.info(
         f"Connecting to ClickHouse, host={args.chhost}, port={args.chport}, username={args.chuser}, password={args.chpass}, s3path={args.s3path}, bucket={args.s3bucket}, s3path={args.s3path}"
@@ -673,15 +714,99 @@ def connect_to_ch():
     )
 
 
+def resolve_static_s3_credentials():
+    if bool(args.s3accesskey) != bool(args.s3secretkey):
+        raise ValueError("s3accesskey and s3secretkey must be specified together")
+    if args.s3sessiontoken and not args.s3accesskey:
+        raise ValueError("s3sessiontoken requires s3accesskey and s3secretkey")
+
+    if args.s3accesskey:
+        return args.s3accesskey, args.s3secretkey, args.s3sessiontoken or None, args.s3region, "static"
+
+    return None, None, None, args.s3region, "anonymous"
+
+
+def resolve_aws_s3_credentials():
+    if args.s3accesskey or args.s3secretkey or args.s3sessiontoken:
+        raise ValueError("s3auth=aws cannot be combined with explicit S3 access keys")
+
+    try:
+        import boto3
+    except ImportError as exc:
+        raise UserVisibleError("boto3 is required for s3auth=aws") from exc
+
+    session = boto3.Session(
+        profile_name=args.s3profile or None,
+        region_name=args.s3region,
+    )
+    credentials = session.get_credentials()
+    if credentials is None:
+        profile_hint = f" profile {args.s3profile}" if args.s3profile else ""
+        raise UserVisibleError(f"unable to resolve AWS credentials{profile_hint}")
+
+    frozen_credentials = credentials.get_frozen_credentials()
+    if not frozen_credentials.access_key or not frozen_credentials.secret_key:
+        profile_hint = f" profile {args.s3profile}" if args.s3profile else ""
+        raise UserVisibleError(f"resolved AWS credentials{profile_hint} are incomplete")
+
+    return (
+        frozen_credentials.access_key,
+        frozen_credentials.secret_key,
+        frozen_credentials.token,
+        args.s3region or session.region_name,
+        "aws",
+    )
+
+
+AUTH_MODES = ("static", "aws", "iam")
+
+
+def resolve_iam_s3_credentials():
+    """Workload identity via MinIO's own provider — IRSA, IMDS or ECS task role.
+
+    Kept as a first-class mode rather than folded into `aws`: it needs no boto3,
+    and it is what the validated Kubernetes deployments use. `credentials=` is
+    returned instead of keys so MinIO can refresh the temporary credentials.
+    """
+    return None, None, None, args.s3region, "iam"
+
+
+def resolve_s3_credentials():
+    auth_mode = args.s3auth.lower()
+    if auth_mode not in AUTH_MODES:
+        raise ValueError(f"s3auth must be one of {', '.join(AUTH_MODES)}")
+
+    # Implied modes. Both are conveniences, so a contradiction is an error rather
+    # than a silent winner: picking one would send credentials nobody asked for.
+    if args.s3profile:
+        if auth_mode not in ("static", "aws"):
+            raise ValueError(f"s3profile implies s3auth=aws, which conflicts with s3auth={auth_mode}")
+        auth_mode = "aws"
+    if args.s3useiam:
+        logger.warning(
+            "s3useiam is deprecated; use s3auth=iam. Continuing with s3auth=iam."
+        )
+        if auth_mode not in ("static", "iam"):
+            raise ValueError(f"s3useiam implies s3auth=iam, which conflicts with s3auth={auth_mode}")
+        auth_mode = "iam"
+
+    if auth_mode == "aws":
+        return resolve_aws_s3_credentials()
+    if auth_mode == "iam":
+        return resolve_iam_s3_credentials()
+
+    return resolve_static_s3_credentials()
+
+
 def connect_to_s3():
     if args.s3secure_flag:
         logger.debug(f"using SSL certificate {args.s3sslcertfile}")
         os.environ["SSL_CERT_FILE"] = args.s3sslcertfile
 
-    authentication = "AWS workload identity" if args.s3useiam else "static credentials"
+    access_key, secret_key, session_token, s3_region, s3_auth = resolve_s3_credentials()
     logger.info(
-        f"Connecting to S3, host:port={args.s3ip}:{args.s3port}, authentication={authentication}, "
-        f"secure={args.s3secure_flag}, region={args.s3region}"
+        f"Connecting to S3, host:port={args.s3ip}:{args.s3port}, auth={s3_auth}, "
+        f"secure={args.s3secure_flag}, region={s3_region}"
     )
 
     # Google Cloud Storage's S3-compatible API has no batch DeleteObjects, so
@@ -697,7 +822,7 @@ def connect_to_s3():
     global minio_client
     connection_options = {
         "secure": args.s3secure_flag,
-        "region": args.s3region,
+        "region": s3_region,
         "http_client": urllib3.PoolManager(
             cert_reqs="CERT_NONE",
             timeout=urllib3.Timeout(
@@ -714,11 +839,16 @@ def connect_to_s3():
             ),
         ),
     }
-    if args.s3useiam:
+    if s3_auth == "iam":
+        # Hand MinIO the provider, not frozen keys, so it can refresh the
+        # temporary credentials for the lifetime of a long collect or delete.
         connection_options["credentials"] = IamAwsProvider()
     else:
-        connection_options["access_key"] = args.s3accesskey
-        connection_options["secret_key"] = args.s3secretkey
+        # static, aws and anonymous all arrive here as resolved values;
+        # session_token is None unless temporary credentials were supplied.
+        connection_options["access_key"] = access_key
+        connection_options["secret_key"] = secret_key
+        connection_options["session_token"] = session_token
     minio_client = Minio(
         f"{args.s3ip}:{args.s3port}",
         **connection_options,
@@ -747,6 +877,27 @@ def remove_objects_reconnecting(batch_rows):
             connect_to_s3()
 
     raise AssertionError("unreachable")
+
+
+def format_s3_list_error(exc):
+    code = getattr(exc, "code", "unknown")
+    message = getattr(exc, "message", str(exc))
+    profile_arg = f" --profile {args.s3profile}" if args.s3profile else ""
+    return (
+        f"unable to list S3 objects for bucket={args.s3bucket!r}, prefix={args.s3path!r}: "
+        f"{code}: {message}. "
+        f"s3gc collection requires s3:ListBucket on arn:aws:s3:::{args.s3bucket} "
+        f"for this prefix, even with --dry-run. Verify the same credentials with: "
+        f"aws sts get-caller-identity{profile_arg}; "
+        f"aws s3api list-objects-v2 --bucket {args.s3bucket} --prefix {args.s3path} --max-keys 1{profile_arg}"
+    )
+
+
+def next_s3_object(objects):
+    try:
+        return next(objects)
+    except S3Error as exc:
+        raise UserVisibleError(format_s3_list_error(exc)) from exc
 
 
 def do_collect():
@@ -784,7 +935,7 @@ def do_collect():
         objs = []
         for batch_element in range(0, args.collectbatchsize):
             try:
-                obj = next(objects)
+                obj = next_s3_object(objects)
                 delta = datetime.datetime.now(datetime.timezone.utc) - obj.last_modified
                 # total_seconds(), not .seconds: the latter is the sub-day
                 # remainder (0..86399), so any object older than a day reported
@@ -1017,15 +1168,22 @@ def do_use():
 
 
 def main():
-    connect_to_ch()
-    if not (args.usecollected_flag and args.dryrun_flag):
-        connect_to_s3()
-    if not args.usecollected_flag:
-        do_collect()
-    if not args.collectonly_flag:
-        do_use()
+    try:
+        connect_to_ch()
+        if not (args.usecollected_flag and args.dryrun_flag):
+            connect_to_s3()
+        if not args.usecollected_flag:
+            do_collect()
+        if not args.collectonly_flag:
+            do_use()
 
-    graceful_exit()
+        graceful_exit()
+    except UserVisibleError as exc:
+        if args.debug_flag:
+            logger.exception(str(exc))
+        else:
+            logger.error(str(exc))
+        sys.exit(1)
 
 
 if __name__ == "__main__":

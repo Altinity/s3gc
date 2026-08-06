@@ -103,6 +103,28 @@ export S3GC_CHPASS='<clickhouse-password>'
 export S3GC_S3USEIAM=true
 ```
 
+Every `S3GC_*` boolean accepts `true/false`, `yes/no`, `on/off`, `1/0`, or an
+empty value for false. Unset also means false.
+
+### Collect has no resume — shard large buckets
+
+A crashed or interrupted `--collectonly` restarts its listing from the
+beginning; there is no checkpoint. On a multi-million-object bucket that can
+cost hours, and long runs are exactly where a rotating password or a dropped
+connection tends to strike.
+
+Shard the listing by prefix and re-run only the shards that failed. This is safe
+to repeat: the auxiliary table is a `ReplacingMergeTree` keyed on `objpath`, so
+re-listing a shard is idempotent.
+
+```bash
+# buckets laid out as <prefix>/<3-char hash>/<blob>
+for shard in 0 1 2 3 4 5 6 7 8 9 a b c d e f g h i j k l m n o p q r s t u v w x y z; do
+  S3GC_S3PATH="<prefix>/${shard}" ./s3gc.py --collectonly --keepdata || \
+    echo "shard ${shard} FAILED — re-run just this one"
+done
+```
+
 ### IAM role support
 
 With `S3GC_S3USEIAM=true`, `s3gc` uses MinIO's AWS IAM credential provider.
@@ -137,21 +159,40 @@ customer or production work; use the reviewed Kubernetes workflow instead.
 
 ## Container image
 
-Build the image locally:
+Released images are **public** at `ghcr.io/altinity/s3gc`, so Kubernetes needs no
+`imagePullSecret`. Always reference them **by digest**, never by tag — tags get
+re-pushed and stop reproducing what you tested:
+
+```bash
+docker pull ghcr.io/altinity/s3gc@sha256:<digest>
+```
+
+CI prints the exact `IMAGE=` line in its job summary; paste that into your
+`.env`. `render.py` refuses anything not digest-pinned.
+
+Build locally for a quick check:
 
 ```bash
 docker build -f docker/Dockerfile -t s3gc:local .
 ```
 
-For a Kubernetes image, build and publish both supported architectures:
+To publish by hand, **both architectures are mandatory** — ClickHouse node pools
+are frequently arm64, and an amd64-only image will not schedule there:
 
 ```bash
 docker buildx build --platform linux/amd64,linux/arm64 \
-  -f docker/Dockerfile -t <registry>/s3gc:<tag> --push .
+  -f docker/Dockerfile -t ghcr.io/altinity/s3gc:<tag> --push .
+docker buildx imagetools inspect ghcr.io/altinity/s3gc:<tag>   # expect amd64 AND arm64
 ```
 
-The CI workflow publishes only from trusted pushes to protected `master`;
-pull requests run tests but do not receive registry credentials.
+> Buildx builder containers cache `/etc/resolv.conf` at creation time. A builder
+> left running across a network or VPN change fails with
+> `lookup registry-1.docker.io: i/o timeout` while the host resolves fine.
+> Recreate the builder, or create one with `--driver-opt network=host`.
+
+The CI workflow runs tests on every pull request and publishes from pushes to
+`master` and version tags, authenticating to GHCR with the automatic
+`GITHUB_TOKEN`.
 
 ## Kubernetes
 

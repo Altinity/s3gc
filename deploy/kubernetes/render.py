@@ -89,6 +89,27 @@ def validate(values: dict[str, str]) -> None:
         raise ValueError("ORDER_BY_OBJPATH must be true or false")
 
 
+def drop_empty_image_pull_secret(manifest: str) -> str:
+    """Remove the imagePullSecrets block when no secret was configured.
+
+    The published image is public, so most deployments need no pull secret at
+    all — and rendering `- name: ""` would be both meaningless and rejected.
+    string.Template has no conditionals, so this is done after substitution.
+    """
+    lines = manifest.splitlines(keepends=True)
+    out = []
+    index = 0
+    while index < len(lines):
+        if lines[index].strip() == "imagePullSecrets:" and index + 1 < len(lines):
+            following = lines[index + 1].strip()
+            if following in ('- name: ""', "- name: ''", "- name:"):
+                index += 2
+                continue
+        out.append(lines[index])
+        index += 1
+    return "".join(out)
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         print(f"usage: {Path(sys.argv[0]).name} CONFIG.env", file=sys.stderr)
@@ -96,7 +117,8 @@ def main() -> int:
     try:
         values = read_values(Path(sys.argv[1]))
         validate(values)
-        sys.stdout.write(Template(TEMPLATE.read_text()).substitute(values))
+        rendered = Template(TEMPLATE.read_text()).substitute(values)
+        sys.stdout.write(drop_empty_image_pull_secret(rendered))
     except (OSError, ValueError, KeyError) as exc:
         print(f"render error: {exc}", file=sys.stderr)
         return 64

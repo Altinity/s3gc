@@ -49,6 +49,23 @@ def strtobool(value):
         return 0
     raise ValueError(f"invalid truth value {value!r}")
 
+
+def coerce_bool(value):
+    """Normalise anything an option may arrive as into a real bool.
+
+    Flags declared with action="store_true" are set to a real bool on the command
+    line, but jsonargparse populates them from the environment as the RAW STRING.
+    Every non-empty string is truthy in Python, so S3GC_DRYRUN_FLAG=false used to
+    mean *true*. Treat unset/empty as false and parse the usual spellings.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None or value == "":
+        return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return bool(strtobool(str(value)))
+
 parser = ArgumentParser(
     usage=usage, env_prefix="S3GC", default_env=True, exit_on_error=False
 )
@@ -325,13 +342,6 @@ parser.add_argument(
     help="Order anti-join output by object path (costly for large Kubernetes Jobs)",
 )
 parser.add_argument(
-    "--order-by-objpath-flag",
-    dest="order_by_objpath",
-    type=bool,
-    default=False,
-    help="Order anti-join output by object path (costly for large Kubernetes Jobs)",
-)
-parser.add_argument(
     "--s3-connect-timeout",
     dest="s3_connect_timeout",
     type=int,
@@ -398,7 +408,7 @@ parser.add_argument(
     "--useremoveobjects",
     "--use-remove-objects",
     dest="use_remove_objects",
-    type=bool,
+    type=coerce_bool,
     default=True,
     help="use remove_objects (not supported by GCE). Set it to false to use remove_object",
 )
@@ -474,6 +484,41 @@ parser.add_argument("--cfg", action=ActionConfigFile)
 # print(out)
 
 args = parser.parse_args()
+
+# Every flag declared with action="store_true" arrives from the environment as a
+# raw string, and every non-empty string is truthy — so S3GC_S3USEIAM=false used
+# to select the IAM credential provider and hang a Kubernetes Job indefinitely.
+# Normalise all boolean options in one place, immediately after parsing, so the
+# rest of the program can rely on real bools.
+BOOLEAN_DESTS = (
+    "s3secure_flag",
+    "s3useiam",
+    "use_remove_objects",
+    "keepdata_flag",
+    "collectonly_flag",
+    "usecollected_flag",
+    "dryrun_flag",
+    "order_by_objpath",
+    "createdatabase_flag",
+    "drop_collecttable_flag",
+    "verbose_flag",
+    "debug_flag",
+    "silent_flag",
+    "listoptions",
+)
+
+for _dest in BOOLEAN_DESTS:
+    if not hasattr(args, _dest):
+        continue
+    _raw = getattr(args, _dest)
+    try:
+        setattr(args, _dest, coerce_bool(_raw))
+    except ValueError:
+        parser.error(
+            f"invalid boolean value {_raw!r} for {_dest} "
+            f"(environment variable S3GC_{_dest.upper()}); "
+            "use one of true/false, yes/no, on/off, 1/0"
+        )
 
 if args.listoptions:
     with redirect_stdout(StringIO()) as f:
@@ -631,6 +676,17 @@ def connect_to_s3():
         f"Connecting to S3, host:port={args.s3ip}:{args.s3port}, authentication={authentication}, "
         f"secure={args.s3secure_flag}, region={args.s3region}"
     )
+
+    # Google Cloud Storage's S3-compatible API has no batch DeleteObjects, so
+    # remove_objects() fails there. Switch to the per-object path automatically
+    # rather than letting every delete fail at run time.
+    if "storage.googleapis.com" in args.s3ip and args.use_remove_objects:
+        logger.warning(
+            "GCS endpoint detected: batch remove_objects is not supported there, "
+            "falling back to per-object remove_object. This is markedly slower "
+            "(one request per object); pass --use-remove-objects false to silence this."
+        )
+        args.use_remove_objects = False
     global minio_client
     connection_options = {
         "secure": args.s3secure_flag,
@@ -723,7 +779,10 @@ def do_collect():
             try:
                 obj = next(objects)
                 delta = datetime.datetime.now(datetime.timezone.utc) - obj.last_modified
-                hours = int(delta.seconds / 3600)
+                # total_seconds(), not .seconds: the latter is the sub-day
+                # remainder (0..86399), so any object older than a day reported
+                # at most 23 hours and --age 24 collected nothing at all.
+                hours = int(delta.total_seconds() // 3600)
                 if hours >= args.age:
                     objs.append([obj.object_name, obj.size, obj.last_modified, True])
                     total_size += obj.size
@@ -747,6 +806,34 @@ def do_collect():
     )
 
 
+def check_samples_match_partitioning():
+    """Warn when --samples disagrees with the aux table's PARTITION BY.
+
+    The table is created as PARTITION BY CRC32(objpath) % <samples> at COLLECT
+    time. Running the use phase with a different --samples silently loses
+    partition pruning: on one production cluster the matching case scanned a
+    sample in ~2 min where the mismatching case took ~26 min.
+    """
+    try:
+        rows = ch_client.query(
+            "SELECT partition_key FROM system.tables "
+            f"WHERE database = currentDatabase() AND name = '{tname.strip('`').split('.')[-1]}'"
+        ).result_rows
+    except Exception as exc:
+        logger.debug(f"could not read partition_key for {tname}: {exc}")
+        return
+    if not rows or not rows[0][0]:
+        return
+    partition_key = rows[0][0]
+    expected = f"% {args.samples}"
+    if "CRC32" in partition_key and expected not in partition_key.replace(" ", " "):
+        logger.warning(
+            f"--samples {args.samples} does not match the auxiliary table's "
+            f"partitioning ({partition_key}). Partition pruning will be lost; "
+            "use the same --samples value that the collect phase used."
+        )
+
+
 def do_use():
     if not args.dryrun_flag:
         preflight_cluster()
@@ -765,9 +852,18 @@ def do_use():
         logger.info(f"exception selecting from {tname}, {exc}")
         pass
     if num_rows == 0:
-        logger.info(f"auxiliary table {tname} does not exist or empty, nothing to do")
+        # Exiting 0 here reads as success, but with --usecollected an absent or
+        # empty auxiliary table means the collect never ran, ran against another
+        # host, or was truncated. The table is a NODE-LOCAL ReplacingMergeTree, so
+        # a load-balanced ClickHouse Service can collect on one replica and land
+        # here on the other. Fail loudly instead of reporting a clean bucket.
+        raise RuntimeError(
+            f"auxiliary table {tname} does not exist or is empty on {args.chhost}. "
+            "Run the collect phase first, and make sure every phase targets the SAME "
+            "replica: the table is node-local, so a load-balanced Service will not do."
+        )
 
-        graceful_exit()
+    check_samples_match_partitioning()
 
     def make_antijoin(calc_only=False, sample=None):
         after_condition = f"AND s3o.objpath > {args.useafter} " if args.useafter else ""
@@ -888,9 +984,25 @@ def do_use():
                             f"{len(errors)} S3 deletion error(s); successful deletes were checkpointed"
                         )
 
+    # "this attempt", not "this run": a resumed run leaves earlier attempts'
+    # deletions out of these counters, so the line understated one aps1 run by
+    # 16.61 TiB. The cumulative truth is the tombstone count in the aux table.
     logger.info(
-        f"{num_removed} objects of total size {total_size} {'are removed' if not args.dryrun_flag else 'would be removed but for dryrun flag'}"
+        f"{num_removed} objects of total size {total_size} "
+        f"{'are removed' if not args.dryrun_flag else 'would be removed but for dryrun flag'} "
+        "in this attempt"
     )
+    if not args.dryrun_flag:
+        try:
+            cumulative = ch_client.query(
+                f"SELECT count(), sum(size) FROM {tname} FINAL WHERE active = false"
+            ).result_rows[0]
+            logger.info(
+                f"cumulative for this auxiliary table: {cumulative[0]} objects / "
+                f"{cumulative[1]} bytes tombstoned"
+            )
+        except Exception as exc:  # never fail a completed run over a status query
+            logger.info(f"could not read cumulative tombstone count: {exc}")
 
     if not args.keepdata_flag and not args.dryrun_flag:
         logger.info(f"truncating {tname}")

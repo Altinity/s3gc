@@ -92,7 +92,6 @@ or interactive shell rather than saving them in a file:
 export S3GC_CHPASS='<clickhouse-password>'
 export S3GC_S3ACCESSKEY='<s3-access-key>'
 export S3GC_S3SECRETKEY='<s3-secret-key>'
-export S3GC_S3USEIAM=false
 ```
 
 Every `S3GC_*` boolean accepts `true/false`, `yes/no`, `on/off`, `1/0`, or an
@@ -108,9 +107,8 @@ Select one with `S3GC_S3AUTH` (or `--s3auth`):
 | `aws` | boto3 credential chain, optionally `S3GC_S3PROFILE` | **yes** | AWS SSO / named profiles on a workstation |
 | `iam` | MinIO workload identity provider | no | EKS IRSA, EC2 instance profile, ECS task role |
 
-`S3GC_S3PROFILE` implies `aws`. `S3GC_S3USEIAM=true` is a **deprecated alias**
-for `S3GC_S3AUTH=iam` — it still works and logs a deprecation warning.
-Contradictory combinations are rejected rather than silently resolved.
+`S3GC_S3PROFILE` implies `aws`. Contradictory combinations are rejected rather
+than silently resolved.
 
 Prefer `iam` over `aws` inside Kubernetes: it refreshes temporary credentials
 through MinIO's provider and keeps `boto3` out of the request path.
@@ -147,7 +145,7 @@ aws s3api list-objects-v2 --bucket <bucket> --prefix <prefix> --max-keys 1 --pro
 
 ```bash
 export S3GC_CHPASS='<clickhouse-password>'
-export S3GC_S3AUTH=iam        # or the deprecated S3GC_S3USEIAM=true
+export S3GC_S3AUTH=iam
 ```
 
 #### GCS and other stores without batch delete
@@ -188,7 +186,7 @@ done
 
 ### IAM role support
 
-With `S3GC_S3USEIAM=true`, `s3gc` uses MinIO's AWS IAM credential provider.
+With `S3GC_S3AUTH=iam`, `s3gc` uses MinIO's AWS IAM credential provider.
 It obtains and refreshes temporary credentials from one of these environments:
 
 - an EKS Pod using IRSA/workload identity (`AWS_WEB_IDENTITY_TOKEN_FILE` and
@@ -196,7 +194,7 @@ It obtains and refreshes temporary credentials from one of these environments:
 - an EC2 instance with an attached instance profile; or
 - an ECS task with task-role credentials.
 
-Setting `S3GC_S3USEIAM=true` on an ordinary workstation is not enough. The
+Setting `S3GC_S3AUTH=iam` on an ordinary workstation is not enough. The
 current provider does **not** read AWS CLI profiles, `aws sso login` state,
 `~/.aws/config`, or `AWS_PROFILE`. For a direct local run, use static S3 keys
 or run the script from an identity-enabled EC2/EKS/ECS environment.

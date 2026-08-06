@@ -49,7 +49,6 @@ needed.
 | `aws` | boto3 chain, optionally `S3PROFILE` | **yes** | rarely in-cluster; this is a workstation SSO path |
 
 `S3PROFILE` requires `S3AUTH=aws` and the renderer rejects other combinations.
-`S3GC_S3USEIAM=true` still works as a deprecated alias for `S3AUTH=iam`.
 
 Prefer `iam`: it hands MinIO the credential provider, so temporary credentials
 refresh during a long collect or delete instead of expiring mid-run.

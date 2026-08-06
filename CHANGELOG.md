@@ -19,27 +19,6 @@ Changes below are on `feature/kubernetes-job-runner` and not yet released.
 
 ### Fixed
 
-- **`--s3useiam` was missing its `type=bool` twin, and the resulting misparse hung a
-  production Job indefinitely.** The codebase pairs each `action="store_true"` flag
-  with a second `type=bool` argument sharing the same `dest`, because
-  `jsonargparse` populates `store_true` flags from the environment as the **raw
-  string** and every non-empty string is truthy in Python. Eleven of the thirteen
-  boolean flags had that twin and behaved correctly; `--s3useiam` did not, so
-  `S3GC_S3USEIAM=false` meant *true*.
-
-  The affected Job selected `IamAwsProvider()` instead of the static keys in its
-  Secret and wedged in the IMDS credential loop: no error, no exception, no log
-  line, zero rows after five minutes, no `:443` connection ever opened, 0.34 s of
-  CPU — only `activeDeadlineSeconds` ended it. Removing the variable made the same
-  image, Secret and manifest work immediately at ~3,500 objects/s.
-
-  *Fix:* rather than add a twelfth twin — the pattern is easy to forget, which is
-  exactly how this defect arose — all boolean options are now coerced once after
-  parsing through the existing `strtobool` helper. The twins are retained for
-  command-line compatibility and now share the same coercion, which also means
-  they accept `0`, `1` and empty values; `type=bool` rejected those with an
-  `ArgumentError`. Unset and empty both mean false.
-
 - **`--age` silently collected nothing for anything older than a day.** The
   filter used `timedelta.seconds`, the sub-day remainder (0..86399), so computed
   age never exceeded 23 h: a 30 d 5 h old object reported **5**. Harmless at the
@@ -78,11 +57,9 @@ Changes below are on `feature/kubernetes-job-runner` and not yet released.
   | `aws` | boto3 chain / `--s3profile` | **yes** |
   | `iam` | MinIO workload identity (IRSA/IMDS/ECS) | no |
 
-  `--s3profile` implies `aws`; **`--s3useiam` is now a deprecated alias for
-  `--s3auth=iam`** and still works, with a warning — every existing manifest and
-  Secret keeps working unchanged. Contradictory combinations are rejected rather than
-  silently resolved, so nobody ends up authenticating with an identity they did not
-  ask for.
+  `--s3profile` implies `aws`. Contradictory combinations are rejected rather
+  than silently resolved, so nobody ends up authenticating with an identity they
+  did not ask for.
 
 - **Operator-facing S3 listing errors**, also from PR #2: a failed listing now names
   the required permission (`s3:ListBucket` on the bucket ARN, **even for
@@ -143,6 +120,9 @@ Changes below are on `feature/kubernetes-job-runner` and not yet released.
 - **CI validates the rendered manifest** with `kubectl apply --dry-run=client`
   in addition to running the tests and the renderer.
 
+- Removed the deprecated S3 IAM selector. `S3AUTH=static|aws|iam` is now the
+  only supported authentication interface.
+
 ### Documentation
 
 - `CHHOST` must be a **per-replica** Service, never the load-balanced one, and
@@ -166,19 +146,6 @@ Changes below are on `feature/kubernetes-job-runner` and not yet released.
 
 ### Migration notes
 
-- **Saved rendering env files must be updated: `S3USEIAM` → `S3AUTH` (+ `S3PROFILE`).**
-  `job.yaml.tmpl` no longer emits `S3GC_S3USEIAM`, and `render.py` now *requires*
-  `S3AUTH` and `S3PROFILE`, so an env file kept from before this change fails with:
-
-  ```
-  render error: missing required values: S3AUTH, S3PROFILE
-  ```
-
-  Replace `S3USEIAM=true` with `S3AUTH=iam`, or `S3USEIAM=false` with `S3AUTH=static`,
-  and add an empty `S3PROFILE=`. Note this only affects the **rendering** env file;
-  the `S3GC_S3USEIAM` *environment variable* is still honoured by the script itself as
-  a deprecated alias, so a Job manifest already deployed keeps working.
-
 - **Pull secrets are registry-scoped.** Moving from Docker Hub to GHCR silently
   invalidates an existing `imagePullSecret` even though its *name* still looks
   right: a secret holding `index.docker.io` credentials does not apply to
@@ -191,13 +158,6 @@ Changes below are on `feature/kubernetes-job-runner` and not yet released.
   settings. It cannot be done through the REST API — the visibility endpoint
   returns 404 and the standard token lacks `write:packages`. Until it is flipped,
   every pull still needs credentials and the benefit above is not realised.
-
-- **`S3GC_S3USEIAM=false` now means false.** Deployments that set it expecting
-  static credentials were previously getting the IAM chain instead — and, on a
-  cluster without a usable workload identity, an indefinite hang. After this
-  change they get what they asked for. No action is needed unless a deployment
-  was relying on the broken behaviour to reach IAM, in which case set it to
-  `true` explicitly.
 
 ### Verified
 

@@ -1,3 +1,4 @@
+from argparse import ArgumentError
 import os
 import subprocess
 import sys
@@ -86,7 +87,6 @@ def args_factory():
             # S3 auth surface (static | aws | iam)
             "s3auth": "static",
             "s3profile": "",
-            "s3useiam": False,
             "s3accesskey": "",
             "s3secretkey": "",
             "s3sessiontoken": "",
@@ -383,7 +383,6 @@ def test_coerce_bool_rejects_nonsense(s3gc_module):
 @pytest.mark.parametrize(
     "dest, env_name",
     [
-        ("s3useiam", "S3GC_S3USEIAM"),
         ("s3secure_flag", "S3GC_S3SECURE_FLAG"),
         ("dryrun_flag", "S3GC_DRYRUN_FLAG"),
         ("keepdata_flag", "S3GC_KEEPDATA_FLAG"),
@@ -392,25 +391,9 @@ def test_coerce_bool_rejects_nonsense(s3gc_module):
     ],
 )
 def test_boolean_env_false_is_false(monkeypatch, dest, env_name):
-    """S3GC_*=false used to be the truthy string 'false'.
-
-    S3GC_S3USEIAM=false selected the IAM credential provider and hung a
-    Kubernetes Job indefinitely with no error, no exception and no log line.
-    """
+    """S3GC_*=false must not remain the truthy string 'false'."""
     module = _load_with_env(monkeypatch, **{env_name: "false"})
     assert getattr(module["args"], dest) is False
-
-
-@pytest.mark.parametrize("value", ["true", "1", "yes"])
-def test_boolean_env_true_is_true(monkeypatch, value):
-    module = _load_with_env(monkeypatch, S3GC_S3USEIAM=value)
-    assert module["args"].s3useiam is True
-
-
-def test_boolean_env_zero_is_false(monkeypatch):
-    """'0' must not be truthy either, and must not raise (type=bool would)."""
-    module = _load_with_env(monkeypatch, S3GC_S3USEIAM="0")
-    assert module["args"].s3useiam is False
 
 
 def test_bare_cli_flag_still_enables(monkeypatch):
@@ -421,6 +404,15 @@ def test_bare_cli_flag_still_enables(monkeypatch):
     monkeypatch.setattr(sys, "argv", [str(root / "s3gc.py"), "--dryrun"])
     module = runpy.run_path(str(root / "s3gc.py"), run_name="s3gc_test")
     assert module["args"].dryrun_flag is True
+
+
+def test_removed_s3useiam_cli_flag_is_rejected(monkeypatch):
+    import runpy
+
+    root = Path(__file__).resolve().parents[1]
+    monkeypatch.setattr(sys, "argv", [str(root / "s3gc.py"), "--s3useiam"])
+    with pytest.raises(ArgumentError, match="Unrecognized arguments: --s3useiam"):
+        runpy.run_path(str(root / "s3gc.py"), run_name="s3gc_test")
 
 
 def test_collect_age_filter_uses_total_seconds(s3gc_module, args_factory, monkeypatch):
@@ -531,7 +523,6 @@ def test_gcs_endpoint_disables_batch_delete(s3gc_module, args_factory, monkeypat
         s3ip="storage.googleapis.com",
         s3port=443,
         use_remove_objects=True,
-        s3useiam=False,
         s3secure_flag=True,
         s3accesskey="k",
         s3secretkey="s",
@@ -594,7 +585,7 @@ def test_renderer_keeps_configured_image_pull_secret(tmp_path):
 def _resolve(s3gc_module, monkeypatch, **overrides):
     namespace = s3gc_module["resolve_s3_credentials"].__globals__
     args = types.SimpleNamespace(
-        s3auth="static", s3profile="", s3useiam=False,
+        s3auth="static", s3profile="",
         s3accesskey="", s3secretkey="", s3sessiontoken="", s3region="eu-central-1",
     )
     for key, value in overrides.items():
@@ -641,14 +632,6 @@ def test_iam_mode_defers_to_the_provider(s3gc_module, monkeypatch):
     assert result[4] == "iam"
 
 
-def test_s3useiam_is_a_deprecated_alias_for_iam(s3gc_module, monkeypatch, caplog):
-    """Every validated Kubernetes deployment sets S3GC_S3USEIAM=true."""
-    with caplog.at_level("WARNING"):
-        result = _resolve(s3gc_module, monkeypatch, s3useiam=True)
-    assert result[4] == "iam"
-    assert "deprecated" in caplog.text
-
-
 def test_s3profile_implies_aws_mode(s3gc_module, monkeypatch):
     calls = []
     namespace = s3gc_module["resolve_s3_credentials"].__globals__
@@ -669,7 +652,6 @@ def test_unknown_auth_mode_is_rejected(s3gc_module, monkeypatch):
     "overrides",
     [
         {"s3auth": "iam", "s3profile": "sso"},      # profile implies aws, conflicts with iam
-        {"s3auth": "aws", "s3useiam": True},        # s3useiam implies iam, conflicts with aws
     ],
 )
 def test_contradictory_auth_settings_error(s3gc_module, monkeypatch, overrides):

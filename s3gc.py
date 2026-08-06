@@ -193,22 +193,6 @@ parser.add_argument(
     help="S3 disk name",
 )
 parser.add_argument(
-    "--s3useiam",
-    "--s3-use-iam",
-    action="store_true",
-    dest="s3useiam",
-    default=False,
-    help="DEPRECATED alias for --s3auth=iam. Use the workload identity credential chain",
-)
-parser.add_argument(
-    "--s3useiamflag",
-    "--s3-use-iam-flag",
-    type=coerce_bool,
-    dest="s3useiam",
-    default=False,
-    help="DEPRECATED alias for --s3auth=iam. Use the workload identity credential chain",
-)
-parser.add_argument(
     "--keepdata",
     "--keep-data",
     action="store_true",
@@ -526,13 +510,11 @@ parser.add_argument("--cfg", action=ActionConfigFile)
 args = parser.parse_args()
 
 # Every flag declared with action="store_true" arrives from the environment as a
-# raw string, and every non-empty string is truthy — so S3GC_S3USEIAM=false used
-# to select the IAM credential provider and hang a Kubernetes Job indefinitely.
-# Normalise all boolean options in one place, immediately after parsing, so the
-# rest of the program can rely on real bools.
+# raw string, and every non-empty string is truthy. Normalise all boolean
+# options in one place, immediately after parsing, so the rest of the program
+# can rely on real bools.
 BOOLEAN_DESTS = (
     "s3secure_flag",
-    "s3useiam",
     "use_remove_objects",
     "keepdata_flag",
     "collectonly_flag",
@@ -782,14 +764,6 @@ def resolve_s3_credentials():
         if auth_mode not in ("static", "aws"):
             raise ValueError(f"s3profile implies s3auth=aws, which conflicts with s3auth={auth_mode}")
         auth_mode = "aws"
-    if args.s3useiam:
-        logger.warning(
-            "s3useiam is deprecated; use s3auth=iam. Continuing with s3auth=iam."
-        )
-        if auth_mode not in ("static", "iam"):
-            raise ValueError(f"s3useiam implies s3auth=iam, which conflicts with s3auth={auth_mode}")
-        auth_mode = "iam"
-
     if auth_mode == "aws":
         return resolve_aws_s3_credentials()
     if auth_mode == "iam":

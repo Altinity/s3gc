@@ -250,13 +250,8 @@ because it can intentionally delete development objects.
 
 ## History and roadmap
 
-### v0.2 — 2025-01-31
+See [`CHANGELOG.md`](CHANGELOG.md) for the full history, including why each
+change was made and the evidence behind defects found in production use.
 
-- Added an option to avoid batch deletion for services such as GCS.
-
-### v0.1 — 2024-06-12
-
-- Added object last-modified timestamps to the auxiliary table.
-- Added the object age option.
-
-Planned: concurrency and asynchronous collection/deletion.
+Planned: concurrency and asynchronous collection/deletion; a `--collectafter`
+checkpoint so an interrupted collect can resume instead of re-listing.

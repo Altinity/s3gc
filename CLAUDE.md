@@ -51,6 +51,7 @@ tests, explicit delete controls, and conservative deployment defaults.
 | `deploy/kubernetes/job.yaml.tmpl` | Kubernetes Job template with security context and environment wiring. |
 | `deploy/kubernetes/example.env` | Non-secret rendering example; copy it outside the repository for a real run. |
 | `.github/workflows/container.yml` | CI test, render, manifest validation, and container publication workflow. |
+| `CHANGELOG.md` | What changed and **why**, including evidence for defects found in production use. Update it in the same change as any behaviour, safety, or deployment change. |
 
 ## Required checks
 
@@ -76,6 +77,10 @@ percentage until coverage tooling and an enforceable threshold are introduced.
 
 - Keep the command-line and `S3GC_*` environment interfaces compatible unless
   the task explicitly authorizes a breaking operational change.
+- Record behaviour, safety and deployment changes in `CHANGELOG.md` as part of
+  the same change. Write down *why*, and keep the evidence for defects found in
+  production — the reasoning is the expensive part to reconstruct later. Never
+  put customer names, cluster identifiers or credentials there.
 - Treat the renderer, entrypoint, README, and Kubernetes guide as part of the
   same operator-facing contract. Update the affected documentation in the same
   change as an operational behavior change.

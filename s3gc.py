@@ -141,7 +141,7 @@ parser.add_argument(
 parser.add_argument(
     "--s3secureflag",
     "--s3-secure-flag",
-    type=bool,
+    type=coerce_bool,
     dest="s3secure_flag",
     default=False,
     help="S3 secure mode",
@@ -186,7 +186,7 @@ parser.add_argument(
 parser.add_argument(
     "--keepdataflag",
     "--keep-data-flag",
-    type=bool,
+    type=coerce_bool,
     dest="keepdata_flag",
     default=False,
     help="keep auxiliary data in ClickHouse table",
@@ -202,7 +202,7 @@ parser.add_argument(
 parser.add_argument(
     "--collectonlyflag",
     "--collect-only-flag",
-    type=bool,
+    type=coerce_bool,
     dest="collectonly_flag",
     default=False,
     help="put object names to auxiliary table",
@@ -218,7 +218,7 @@ parser.add_argument(
 parser.add_argument(
     "--usecollectedflag",
     "--use-collected-flag",
-    type=bool,
+    type=coerce_bool,
     dest="usecollected_flag",
     default=False,
     help="auxiliary data is already collected in ClickHouse table",
@@ -279,7 +279,7 @@ parser.add_argument(
     "--dryrunflag",
     "--dryrun-flag",
     "--dry-run-flag",
-    type=bool,
+    type=coerce_bool,
     dest="dryrun_flag",
     default=False,
     help="Calculate objects to remove without actual removing",
@@ -342,6 +342,13 @@ parser.add_argument(
     help="Order anti-join output by object path (costly for large Kubernetes Jobs)",
 )
 parser.add_argument(
+    "--order-by-objpath-flag",
+    dest="order_by_objpath",
+    type=coerce_bool,
+    default=False,
+    help="Order anti-join output by object path (costly for large Kubernetes Jobs)",
+)
+parser.add_argument(
     "--s3-connect-timeout",
     dest="s3_connect_timeout",
     type=int,
@@ -384,7 +391,7 @@ parser.add_argument(
     "--create-database-flag",
     "--createdatabase-flag",
     dest="createdatabase_flag",
-    type=bool,
+    type=coerce_bool,
     default=False,
     help="create database for collecttable",
 )
@@ -400,7 +407,7 @@ parser.add_argument(
     "--drop-collecttable-flag",
     "--dropcollecttable-flag",
     dest="drop_collecttable_flag",
-    type=bool,
+    type=coerce_bool,
     default=False,
     help="drop collecttable and recreate; beware of ClickHouse DROP TABLE constraints",
 )
@@ -423,7 +430,7 @@ parser.add_argument(
 parser.add_argument(
     "--interactive-flag",
     dest="interactive_flag",
-    type=bool,
+    type=coerce_bool,
     default=True,
     help="confirm deleting",
 )
@@ -437,7 +444,7 @@ parser.add_argument(
 parser.add_argument(
     "--verboseflag",
     "--verbose-flag",
-    type=bool,
+    type=coerce_bool,
     dest="verbose_flag",
     default=False,
     help="debug output",
@@ -452,7 +459,7 @@ parser.add_argument(
 parser.add_argument(
     "--debugflag",
     "--debug-flag",
-    type=bool,
+    type=coerce_bool,
     dest="debug_flag",
     default=False,
     help="trace output (more verbose)",
@@ -464,7 +471,7 @@ parser.add_argument(
     "--silentflag",
     "--silent-flag",
     dest="silent_flag",
-    type=bool,
+    type=coerce_bool,
     default=False,
     help="no log",
 )

@@ -19,29 +19,26 @@ Changes below are on `feature/kubernetes-job-runner` and not yet released.
 
 ### Fixed
 
-- **Boolean options were unusable from the environment, and one of them hung a
-  production Job indefinitely.** Flags declared with `action="store_true"` are
-  populated by `jsonargparse` from the environment as the **raw string**, and
-  every non-empty string is truthy in Python — so `S3GC_S3USEIAM=false` meant
-  *true*. The affected Job selected `IamAwsProvider()` instead of the static
-  keys in its Secret and wedged in the IMDS credential loop: no error, no
-  exception, no log line, zero rows after five minutes, no `:443` connection
-  ever opened, 0.34 s of CPU — only `activeDeadlineSeconds` ended it. Removing
-  the variable made the same image, Secret and manifest work immediately at
-  ~3,500 objects/s.
+- **`--s3useiam` was missing its `type=bool` twin, and the resulting misparse hung a
+  production Job indefinitely.** The codebase pairs each `action="store_true"` flag
+  with a second `type=bool` argument sharing the same `dest`, because
+  `jsonargparse` populates `store_true` flags from the environment as the **raw
+  string** and every non-empty string is truthy in Python. Eleven of the thirteen
+  boolean flags had that twin and behaved correctly; `--s3useiam` did not, so
+  `S3GC_S3USEIAM=false` meant *true*.
 
-  Thirteen flags shared the defect and four are set by `job.yaml.tmpl`
-  (`S3GC_S3USEIAM`, `S3GC_S3SECURE_FLAG`, `S3GC_ORDER_BY_OBJPATH`,
-  `S3GC_VERBOSE_FLAG`); two were correct only because `"true"` happens to be
-  truthy, and `S3GC_S3SECURE_FLAG=false` would have silently stayed on TLS.
+  The affected Job selected `IamAwsProvider()` instead of the static keys in its
+  Secret and wedged in the IMDS credential loop: no error, no exception, no log
+  line, zero rows after five minutes, no `:443` connection ever opened, 0.34 s of
+  CPU — only `activeDeadlineSeconds` ended it. Removing the variable made the same
+  image, Secret and manifest work immediately at ~3,500 objects/s.
 
-  *Why not `type=bool`:* it raises on `0`, `1` and empty values, and it would
-  force bare flags such as `--collectonly` to take an argument, which
-  `docker/kubernetes-entrypoint.sh` and every documented invocation rely on.
-  Instead all boolean options are coerced once after parsing through the
-  existing `strtobool` helper, accepting `true/false`, `yes/no`, `on/off`,
-  `1/0`, empty and unset. The `--order-by-objpath-flag` twin argument, a
-  previous one-off workaround for this same defect, is retired.
+  *Fix:* rather than add a twelfth twin — the pattern is easy to forget, which is
+  exactly how this defect arose — all boolean options are now coerced once after
+  parsing through the existing `strtobool` helper. The twins are retained for
+  command-line compatibility and now share the same coercion, which also means
+  they accept `0`, `1` and empty values; `type=bool` rejected those with an
+  `ArgumentError`. Unset and empty both mean false.
 
 - **`--age` silently collected nothing for anything older than a day.** The
   filter used `timedelta.seconds`, the sub-day remainder (0..86399), so computed
@@ -123,6 +120,28 @@ Changes below are on `feature/kubernetes-job-runner` and not yet released.
 - Buildx builder containers cache `/etc/resolv.conf` at creation, so a builder
   left running across a network change fails with
   `lookup registry-1.docker.io: i/o timeout` while the host resolves fine.
+
+### Migration notes
+
+- **Pull secrets are registry-scoped.** Moving from Docker Hub to GHCR silently
+  invalidates an existing `imagePullSecret` even though its *name* still looks
+  right: a secret holding `index.docker.io` credentials does not apply to
+  `ghcr.io`, so the kubelet falls back to an anonymous token and the pod sits in
+  `ImagePullBackOff` with `failed to fetch anonymous token: 401 Unauthorized`.
+  With the public image the correct action is to **remove** the secret reference
+  (leave `IMAGE_PULL_SECRET` empty), not to repoint it.
+
+- **The GHCR package must be made public once**, in the organisation's package
+  settings. It cannot be done through the REST API — the visibility endpoint
+  returns 404 and the standard token lacks `write:packages`. Until it is flipped,
+  every pull still needs credentials and the benefit above is not realised.
+
+- **`S3GC_S3USEIAM=false` now means false.** Deployments that set it expecting
+  static credentials were previously getting the IAM chain instead — and, on a
+  cluster without a usable workload identity, an indefinite hang. After this
+  change they get what they asked for. No action is needed unless a deployment
+  was relying on the broken behaviour to reach IAM, in which case set it to
+  `true` explicitly.
 
 ### Known gaps
 

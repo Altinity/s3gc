@@ -170,14 +170,6 @@ resolves after the credential-resolution rewrite, and the referenced tables were
 Unit tests cover the `static`/`aws` modes; the GCS per-object fallback is still only
 unit-tested, pending a real GCS endpoint.
 
-### Known gaps
-
-- **`--collectonly` still has no resume.** The sharding recipe covers it
-  operationally; a `--collectafter` checkpoint would remove the need.
-- **The GHCR package must be marked public once** in the organisation's package
-  settings after the first publish, otherwise pulls still require
-  authentication and the pull-secret benefit is not realised.
-
 ## v0.2 — 2025-01-31
 
 - Added an option to avoid batch deletion for services such as GCS.

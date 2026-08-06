@@ -39,6 +39,11 @@ tests, explicit delete controls, and conservative deployment defaults.
    environment. Add or update a dependency only when it is necessary for the
    requested capability, and test the resulting workflow.
 
+6. **Read project history and backlog before substantive changes.** Review
+   `CHANGELOG.md` for recent behaviour and operational evidence, then `TODO.md`
+   for deliberately deferred work. Do not treat a TODO item as already
+   implemented or use the changelog as a backlog.
+
 ## Repository map
 
 | Path | Purpose |
@@ -51,7 +56,8 @@ tests, explicit delete controls, and conservative deployment defaults.
 | `deploy/kubernetes/job.yaml.tmpl` | Kubernetes Job template with security context and environment wiring. |
 | `deploy/kubernetes/example.env` | Non-secret rendering example; copy it outside the repository for a real run. |
 | `.github/workflows/container.yml` | CI test, render, manifest validation, and container publication workflow. |
-| `CHANGELOG.md` | What changed and **why**, including evidence for defects found in production use. Update it in the same change as any behaviour, safety, or deployment change. |
+| `CHANGELOG.md` | Shipped behaviour and **why**, including evidence for defects found in production use. Update it in the same change as any behaviour, safety, or deployment change. |
+| `TODO.md` | Unshipped engineering and operational follow-ups. Move completed work to the changelog when it lands. |
 
 ## Required checks
 
@@ -81,6 +87,8 @@ percentage until coverage tooling and an enforceable threshold are introduced.
   the same change. Write down *why*, and keep the evidence for defects found in
   production — the reasoning is the expensive part to reconstruct later. Never
   put customer names, cluster identifiers or credentials there.
+- Record pending engineering or operational work in `TODO.md`, not in the
+  changelog. Remove or update the TODO item when the work lands.
 - Treat the renderer, entrypoint, README, and Kubernetes guide as part of the
   same operator-facing contract. Update the affected documentation in the same
   change as an operational behavior change.

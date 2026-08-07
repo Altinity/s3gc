@@ -120,6 +120,9 @@ Changes below are on `feature/kubernetes-job-runner` and not yet released.
 - **CI validates the rendered manifest** with `kubectl apply --dry-run=client`
   in addition to running the tests and the renderer.
 
+- **CI explicitly excludes `dev_cluster` tests.** The pull-request suite stays
+  offline even after opt-in environment-dependent coverage is added.
+
 - Removed the deprecated S3 IAM selector. `S3AUTH=static|aws|iam` is now the
   only supported authentication interface.
 
@@ -127,10 +130,11 @@ Changes below are on `feature/kubernetes-job-runner` and not yet released.
 
 - `CHHOST` must be a **per-replica** Service, never the load-balanced one, and
   every phase of a cleanup must use the same host.
-- The minimum ClickHouse grant set: `SELECT ON system.*`;
-  `SELECT, INSERT, CREATE TABLE ON <db>.*`; `REMOTE ON *.*`. Notably **not**
-  `S3 ON *.*` — `s3gc` lists buckets with its own client, not the `s3()` table
-  function — and not `TRUNCATE` unless `--keepdata` is omitted.
+- S3 authentication guidance now keeps static, AWS SSO/profile, and workload
+  identity modes together; the Kubernetes guide calls out dedicated ClickHouse
+  user provisioning and only the required table and system-table grants.
+- Contributor guidance now requires test-driven, focused coverage for every
+  feature, defect, and material operational behaviour change.
 - Sharding recipe for `--collectonly`, which has no resume: a crash re-lists
   from the beginning, which is expensive on multi-million-object buckets.
   Re-running a shard is safe because the auxiliary table is a

@@ -14,35 +14,41 @@ tests, explicit delete controls, and conservative deployment defaults.
    not retry automatically. A behavior change in this path needs regression
    tests and matching README/deployment documentation.
 
-2. **Tests stay offline by default.** Install both requirements files, then
+2. **Test coverage and TDD are mandatory.** For every new feature, bug fix, or
+   material operational behaviour change, identify the test that covers it; if
+   none exists, add a focused test in the same change. Start behaviour changes
+   with a failing test, and add a regression test for every defect. Purely
+   editorial changes are exempt.
+
+3. **Tests stay offline by default.** Install both requirements files, then
    run `pytest -v` for relevant changes. Tests must use fakes, local
    subprocesses, and manifest dry-runs; they must not contact live ClickHouse,
    S3-compatible storage, or delete objects. The `dev_cluster` marker is
    explicitly environment-dependent and never runs in CI. Do not add live
    credentials or a live-delete test path to the default suite.
 
-3. **No secrets or customer artifacts in Git.** Do not commit S3 keys,
+4. **No secrets or customer artifacts in Git.** Do not commit S3 keys,
    ClickHouse passwords, customer `.env` files, rendered customer manifests,
    target-cluster details, or command output containing them. Keep credentials
    in an approved secret manager, Kubernetes Secret, or workload identity.
    `deploy/kubernetes/example.env` is a non-secret template only.
 
-4. **Kubernetes deployment stays immutable and least-privileged.**
+5. **Kubernetes deployment stays immutable and least-privileged.**
    `deploy/kubernetes/render.py` must continue to reject unpinned images and
    invalid phase/confirmation input. Use image digests, never mutable tags.
    Preserve the Job template's non-root user and read-only root filesystem;
    do not embed credentials in the image or manifest.
 
-5. **Dependencies are deliberate and reproducible.** Runtime dependencies are
+6. **Dependencies are deliberate and reproducible.** Runtime dependencies are
    pinned in `requirements.txt`; test-only dependencies are pinned in
    `requirements-dev.txt`. Use both files when preparing a development or CI
    environment. Add or update a dependency only when it is necessary for the
    requested capability, and test the resulting workflow.
 
-6. **Read project history and backlog before substantive changes.** Review
+7. **Read project history and backlog before substantive changes.** Review
    `CHANGELOG.md` for recent behaviour and operational evidence, then `TODO.md`
-   for deliberately deferred work. Do not treat a TODO item as already
-   implemented or use the changelog as a backlog.
+   for possible, interesting, and deliberately deferred improvements. Do not
+   treat a TODO item as already implemented or use the changelog as a backlog.
 
 ## Repository map
 
@@ -57,7 +63,7 @@ tests, explicit delete controls, and conservative deployment defaults.
 | `deploy/kubernetes/example.env` | Non-secret rendering example; copy it outside the repository for a real run. |
 | `.github/workflows/container.yml` | CI test, render, manifest validation, and container publication workflow. |
 | `CHANGELOG.md` | Shipped behaviour and **why**, including evidence for defects found in production use. Update it in the same change as any behaviour, safety, or deployment change. |
-| `TODO.md` | Unshipped engineering and operational follow-ups. Move completed work to the changelog when it lands. |
+| `TODO.md` | Possible, interesting, and deliberately deferred engineering or operational improvements. Move completed work to the changelog when it lands. |
 
 ## Required checks
 
@@ -87,8 +93,9 @@ percentage until coverage tooling and an enforceable threshold are introduced.
   the same change. Write down *why*, and keep the evidence for defects found in
   production — the reasoning is the expensive part to reconstruct later. Never
   put customer names, cluster identifiers or credentials there.
-- Record pending engineering or operational work in `TODO.md`, not in the
-  changelog. Remove or update the TODO item when the work lands.
+- Record possible, interesting, or pending engineering and operational
+  improvements in `TODO.md`, not in the changelog. Remove or update the TODO
+  item when the work lands.
 - Treat the renderer, entrypoint, README, and Kubernetes guide as part of the
   same operator-facing contract. Update the affected documentation in the same
   change as an operational behavior change.

@@ -1,7 +1,8 @@
 # TODO
 
-Unshipped engineering and operational follow-ups. Completed behaviour belongs
-in `CHANGELOG.md`; this file is the forward-looking backlog.
+Possible, interesting, and deliberately deferred engineering or operational
+improvements. Completed behaviour belongs in `CHANGELOG.md`; this file is the
+forward-looking backlog.
 
 - [ ] Add resumable `--collectonly` collection checkpoints. A crash currently
   restarts listing from the beginning; `--collectafter` would allow a large
@@ -13,3 +14,5 @@ in `CHANGELOG.md`; this file is the forward-looking backlog.
 - [ ] Make the `ghcr.io/altinity/s3gc` package public in the organisation's
   package settings after its first publish, so Kubernetes pulls need no
   registry credentials.
+- [ ] Require the `Container / test` GitHub Actions check before pull-request
+  merges in the repository branch-protection settings.

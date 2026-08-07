@@ -22,9 +22,6 @@ needed.
 - Use an immutable, multi-architecture image digest:
   `ghcr.io/altinity/s3gc@sha256:<digest>`. CI prints the exact `IMAGE=` line in
   its job summary. Pin by digest, never by tag — tags get re-pushed.
-- **No pull Secret is required**: the image is public. Leave
-  `IMAGE_PULL_SECRET` empty and the renderer omits the `imagePullSecrets` block.
-  Set it only when pulling from a private mirror.
 - The image must be multi-arch. ClickHouse node pools are often arm64 (one
   customer cluster is 5x arm64 + 1x amd64), and an amd64-only image simply will
   not schedule there.
@@ -55,16 +52,12 @@ refresh during a long collect or delete instead of expiring mid-run.
 
 ### Minimum ClickHouse grants
 
+Create or provision a dedicated ClickHouse user for `s3gc`, then grant it:
+
 ```sql
 GRANT SELECT ON system.*                        TO s3gc;  -- remote_data_paths, one, disks, tables
 GRANT SELECT, INSERT, CREATE TABLE ON <db>.*    TO s3gc;  -- the auxiliary table
-GRANT REMOTE ON *.*                             TO s3gc;  -- clusterAllReplicas()
 ```
-
-`S3 ON *.*` is **not** needed — s3gc lists the bucket with its own client, not
-the `s3()` table function. `TRUNCATE` is only used when `--keepdata` is absent.
-A user cannot self-grant `REMOTE`; grant option only passes on privileges it
-already holds.
 
 ### Values that vary per cluster, and bite when wrong
 

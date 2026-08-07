@@ -3,7 +3,8 @@
 Read `CLAUDE.md`, `CHANGELOG.md`, and `TODO.md` before making substantive
 changes in this repository. `CLAUDE.md` is the full contributor guide and the
 primary source of truth; the changelog provides recent historical context and
-the TODO file records unshipped follow-ups.
+the TODO file records possible, interesting, and deliberately deferred
+improvements.
 
 This file is intentionally short so agent tooling can find the critical rules
 quickly, then defer to `CLAUDE.md` for complete repository guidance.
@@ -16,10 +17,12 @@ quickly, then defer to `CLAUDE.md` for complete repository guidance.
    objects only after collection, dry-run review, explicit confirmation, and
    the applicable ClickHouse cluster/replica preflight. Do not weaken these
    controls without explicit approval and matching tests and documentation.
-3. **Required checks are offline.** Run the relevant pytest suite and
-   Kubernetes renderer/manifest dry-run checks described in `CLAUDE.md`.
-   Automated tests must not contact live ClickHouse or object storage, or
-   delete objects.
+3. **Test coverage and required checks are mandatory.** For every feature,
+   bug fix, or material behaviour change, add a focused test when no existing
+   test covers it; use test-driven development for behaviour changes. Run the
+   relevant offline pytest suite and Kubernetes renderer/manifest dry-run
+   checks described in `CLAUDE.md`. Automated tests must not contact live
+   ClickHouse or object storage, or delete objects.
 4. **No secrets or customer data in Git.** Never commit credentials, customer
    configuration, target-cluster details, or rendered customer manifests. Use
    Kubernetes Secrets or workload identity for production credentials.

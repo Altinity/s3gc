@@ -85,18 +85,6 @@ export S3GC_AGE=24
 export S3GC_USEAGE=24
 ```
 
-For static S3 credentials, inject the following values from a secret manager
-or interactive shell rather than saving them in a file:
-
-```bash
-export S3GC_CHPASS='<clickhouse-password>'
-export S3GC_S3ACCESSKEY='<s3-access-key>'
-export S3GC_S3SECRETKEY='<s3-secret-key>'
-```
-
-Every `S3GC_*` boolean accepts `true/false`, `yes/no`, `on/off`, `1/0`, or an
-empty value for false. Unset also means false.
-
 ### S3 authentication modes
 
 Select one with `S3GC_S3AUTH` (or `--s3auth`):
@@ -110,8 +98,19 @@ Select one with `S3GC_S3AUTH` (or `--s3auth`):
 `S3GC_S3PROFILE` implies `aws`. Contradictory combinations are rejected rather
 than silently resolved.
 
-Prefer `iam` over `aws` inside Kubernetes: it refreshes temporary credentials
-through MinIO's provider and keeps `boto3` out of the request path.
+#### Static credentials
+
+Inject static credentials from a secret manager or interactive shell rather
+than saving them in a file:
+
+```bash
+export S3GC_CHPASS='<clickhouse-password>'
+export S3GC_S3ACCESSKEY='<s3-access-key>'
+export S3GC_S3SECRETKEY='<s3-secret-key>'
+```
+
+Every `S3GC_*` boolean accepts `true/false`, `yes/no`, `on/off`, `1/0`, or an
+empty value for false. Unset also means false.
 
 #### AWS SSO or a named profile
 
@@ -148,6 +147,14 @@ export S3GC_CHPASS='<clickhouse-password>'
 export S3GC_S3AUTH=iam
 ```
 
+`iam` uses MinIO's AWS IAM credential provider and refreshes temporary
+credentials from EKS IRSA/workload identity, an EC2 instance profile, or an ECS
+task role. Prefer it over `aws` inside Kubernetes: it keeps `boto3` out of the
+request path and avoids credentials expiring during a long collect or delete.
+
+It does not read AWS CLI profiles, `aws sso login` state, `~/.aws/config`, or
+`AWS_PROFILE`; use `aws` mode for that workstation workflow.
+
 #### GCS and other stores without batch delete
 
 GCS has no batch `DeleteObjects`. `s3gc` detects a `storage.googleapis.com`
@@ -163,6 +170,16 @@ export S3GC_S3PORT=443
 export S3GC_S3SECURE_FLAG=true
 export S3GC_S3DISKNAME=gcs
 .venv/bin/python ./s3gc.py --verbose --use-remove-objects=false
+```
+
+### Safe split workflow
+
+Collection makes an auxiliary table; the second command reads it and reports
+candidates without deleting objects:
+
+```bash
+.venv/bin/python s3gc.py --collectonly --keepdata
+.venv/bin/python s3gc.py --usecollected --dry-run
 ```
 
 ### Collect has no resume — shard large buckets
@@ -182,33 +199,6 @@ for shard in 0 1 2 3 4 5 6 7 8 9 a b c d e f g h i j k l m n o p q r s t u v w x
   S3GC_S3PATH="<prefix>/${shard}" ./s3gc.py --collectonly --keepdata || \
     echo "shard ${shard} FAILED — re-run just this one"
 done
-```
-
-### IAM role support
-
-With `S3GC_S3AUTH=iam`, `s3gc` uses MinIO's AWS IAM credential provider.
-It obtains and refreshes temporary credentials from one of these environments:
-
-- an EKS Pod using IRSA/workload identity (`AWS_WEB_IDENTITY_TOKEN_FILE` and
-  `AWS_ROLE_ARN`);
-- an EC2 instance with an attached instance profile; or
-- an ECS task with task-role credentials.
-
-Setting `S3GC_S3AUTH=iam` on an ordinary workstation is not enough. The
-current provider does **not** read AWS CLI profiles, `aws sso login` state,
-`~/.aws/config`, or `AWS_PROFILE`. For a direct local run, use static S3 keys
-or run the script from an identity-enabled EC2/EKS/ECS environment.
-
-The static-key path accepts an access key and secret key only; it does not yet
-accept an AWS session token. Therefore, do not copy temporary
-`aws sts assume-role` credentials into the static-key variables.
-
-Run the safe, split workflow directly. Collection makes an auxiliary table;
-the second command reads it and reports candidates without deleting objects:
-
-```bash
-.venv/bin/python s3gc.py --collectonly --keepdata
-.venv/bin/python s3gc.py --usecollected --dry-run
 ```
 
 The same variables can be passed as flags (for example,

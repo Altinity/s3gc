@@ -34,9 +34,15 @@ jobs:
       - run: pytest -v -m "not dev_cluster"
       # The renderer is part of the contract: it refuses images that are not
       # digest-pinned, so a broken template breaks every deployment.
-      - run: python deploy/kubernetes/render.py deploy/kubernetes/example.env > /tmp/s3gc-job.yaml
-      - name: Rendered manifest must be valid Kubernetes
-        run: kubectl apply --dry-run=client -f /tmp/s3gc-job.yaml
+      - run: python deploy/kubernetes/render.py deploy/kubernetes/example.env > "$GITHUB_WORKSPACE/.s3gc-job.yaml"
+      # Client-side kubectl validation requires a Kubernetes API server for
+      # OpenAPI discovery. Kubeconform validates the rendered standard-resource
+      # manifest against pinned Kubernetes schemas without cluster access.
+      - name: Rendered manifest must conform to Kubernetes schemas
+        uses: docker://ghcr.io/yannh/kubeconform@sha256:85dbef6b4b312b99133decc9c6fc9495e9fc5f92293d4ff3b7e1b30f5611823c
+        with:
+          entrypoint: /kubeconform
+          args: -strict -summary /github/workspace/.s3gc-job.yaml
 
   publish:
     needs: test

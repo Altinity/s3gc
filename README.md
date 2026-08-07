@@ -280,7 +280,9 @@ cluster resource:
 
 ```bash
 python3 deploy/kubernetes/render.py deploy/kubernetes/example.env > /tmp/s3gc-job.yaml
-kubectl apply --dry-run=client -f /tmp/s3gc-job.yaml
+docker run --rm --entrypoint /kubeconform -v /tmp:/tmp:ro \
+  ghcr.io/yannh/kubeconform@sha256:85dbef6b4b312b99133decc9c6fc9495e9fc5f92293d4ff3b7e1b30f5611823c \
+  -strict -summary /tmp/s3gc-job.yaml
 ```
 
 The unit suite does not contact ClickHouse, S3, or Kubernetes. The reserved

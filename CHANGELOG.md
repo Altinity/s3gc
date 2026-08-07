@@ -117,8 +117,10 @@ Changes below are on `feature/kubernetes-job-runner` and not yet released.
   where an amd64-only image can only ever schedule on a sixth of the capacity.
   CI builds `linux/amd64,linux/arm64` in a single step.
 
-- **CI validates the rendered manifest** with `kubectl apply --dry-run=client`
-  in addition to running the tests and the renderer.
+- **CI validates the rendered manifest without a Kubernetes cluster.** Strict,
+  digest-pinned Kubeconform schema validation replaces client-side `kubectl`,
+  which attempts OpenAPI discovery against a nonexistent API server on GitHub
+  runners.
 
 - **CI explicitly excludes `dev_cluster` tests.** The pull-request suite stays
   offline even after opt-in environment-dependent coverage is added.

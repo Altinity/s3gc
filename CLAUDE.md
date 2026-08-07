@@ -74,9 +74,11 @@ requirements:
 ```bash
 python3.11 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt -r requirements-dev.txt
-.venv/bin/python -m pytest -v
+.venv/bin/python -m pytest -v -m "not dev_cluster"
 .venv/bin/python deploy/kubernetes/render.py deploy/kubernetes/example.env > /tmp/s3gc-job.yaml
-kubectl apply --dry-run=client -f /tmp/s3gc-job.yaml
+docker run --rm --entrypoint /kubeconform -v /tmp:/tmp:ro \
+  ghcr.io/yannh/kubeconform@sha256:85dbef6b4b312b99133decc9c6fc9495e9fc5f92293d4ff3b7e1b30f5611823c \
+  -strict -summary /tmp/s3gc-job.yaml
 ```
 
 Add a regression test in the same change as each behavior or safety fix. Cover

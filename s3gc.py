@@ -19,6 +19,8 @@ import sys
 from io import StringIO
 from minio import Minio
 from minio.deleteobjects import DeleteObject
+from minio.credentials import IamAwsProvider
+from minio.error import S3Error
 from contextlib import redirect_stdout
 import clickhouse_connect
 
@@ -31,12 +33,38 @@ from jsonargparse.typing import Optional
 import urllib3
 import logging
 import datetime
-from distutils.util import strtobool
 
 usage = """
     s3 garbage collector for ClickHouse
     example: $ ./s3gc.py
 """
+
+
+def strtobool(value):
+    """Minimal stdlib-compatible replacement for distutils.util.strtobool."""
+    normalized = value.lower()
+    if normalized in {"y", "yes", "t", "true", "on", "1"}:
+        return 1
+    if normalized in {"n", "no", "f", "false", "off", "0"}:
+        return 0
+    raise ValueError(f"invalid truth value {value!r}")
+
+
+def coerce_bool(value):
+    """Normalise anything an option may arrive as into a real bool.
+
+    Flags declared with action="store_true" are set to a real bool on the command
+    line, but jsonargparse populates them from the environment as the RAW STRING.
+    Every non-empty string is truthy in Python, so S3GC_DRYRUN_FLAG=false used to
+    mean *true*. Treat unset/empty as false and parse the usual spellings.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None or value == "":
+        return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return bool(strtobool(str(value)))
 
 parser = ArgumentParser(
     usage=usage, env_prefix="S3GC", default_env=True, exit_on_error=False
@@ -103,6 +131,31 @@ parser.add_argument(
     help="S3 secret key",
 )
 parser.add_argument(
+    "--s3-session-token",
+    "--s3sessiontoken",
+    dest="s3sessiontoken",
+    default="",
+    help="S3 session token for explicit temporary credentials",
+)
+parser.add_argument(
+    "--s3auth",
+    "--s3-auth",
+    dest="s3auth",
+    default="static",
+    help=(
+        "S3 auth mode: static, aws or iam. static uses explicit keys (optionally with a "
+        "session token); aws uses the boto3 credential chain, including AWS SSO profiles; "
+        "iam uses MinIO's workload identity provider (IRSA/IMDS/ECS) and needs no boto3"
+    ),
+)
+parser.add_argument(
+    "--s3profile",
+    "--s3-profile",
+    dest="s3profile",
+    default="",
+    help="AWS profile name for S3 auth. Setting this enables aws auth mode",
+)
+parser.add_argument(
     "--s3secure",
     "--s3-secure",
     action="store_true",
@@ -113,7 +166,7 @@ parser.add_argument(
 parser.add_argument(
     "--s3secureflag",
     "--s3-secure-flag",
-    type=bool,
+    type=coerce_bool,
     dest="s3secure_flag",
     default=False,
     help="S3 secure mode",
@@ -150,7 +203,7 @@ parser.add_argument(
 parser.add_argument(
     "--keepdataflag",
     "--keep-data-flag",
-    type=bool,
+    type=coerce_bool,
     dest="keepdata_flag",
     default=False,
     help="keep auxiliary data in ClickHouse table",
@@ -166,7 +219,7 @@ parser.add_argument(
 parser.add_argument(
     "--collectonlyflag",
     "--collect-only-flag",
-    type=bool,
+    type=coerce_bool,
     dest="collectonly_flag",
     default=False,
     help="put object names to auxiliary table",
@@ -182,7 +235,7 @@ parser.add_argument(
 parser.add_argument(
     "--usecollectedflag",
     "--use-collected-flag",
-    type=bool,
+    type=coerce_bool,
     dest="usecollected_flag",
     default=False,
     help="auxiliary data is already collected in ClickHouse table",
@@ -243,7 +296,7 @@ parser.add_argument(
     "--dryrunflag",
     "--dryrun-flag",
     "--dry-run-flag",
-    type=bool,
+    type=coerce_bool,
     dest="dryrun_flag",
     default=False,
     help="Calculate objects to remove without actual removing",
@@ -255,6 +308,12 @@ parser.add_argument(
     dest="clustername",
     default="",
     help="Consider an objects unused if there is no host in the cluster refers the object",
+)
+parser.add_argument(
+    "--expected-replicas",
+    dest="expected_replicas",
+    type=Optional[int],
+    help="Fail before deleting when clusterAllReplicas() does not return this many replicas",
 )
 parser.add_argument(
     "--age",
@@ -285,6 +344,49 @@ parser.add_argument(
     help="Number of partitions in auxiliary table",
 )
 parser.add_argument(
+    "--deletebatchsize",
+    "--delete-batch-size",
+    dest="deletebatchsize",
+    type=int,
+    default=1000,
+    help="S3 objects to delete and checkpoint per progress batch",
+)
+parser.add_argument(
+    "--order-by-objpath",
+    action="store_true",
+    dest="order_by_objpath",
+    default=False,
+    help="Order anti-join output by object path (costly for large Kubernetes Jobs)",
+)
+parser.add_argument(
+    "--order-by-objpath-flag",
+    dest="order_by_objpath",
+    type=coerce_bool,
+    default=False,
+    help="Order anti-join output by object path (costly for large Kubernetes Jobs)",
+)
+parser.add_argument(
+    "--s3-connect-timeout",
+    dest="s3_connect_timeout",
+    type=int,
+    default=15,
+    help="S3 connection timeout in seconds",
+)
+parser.add_argument(
+    "--s3-read-timeout",
+    dest="s3_read_timeout",
+    type=int,
+    default=120,
+    help="S3 read timeout in seconds",
+)
+parser.add_argument(
+    "--s3-retries",
+    dest="s3_retries",
+    type=int,
+    default=3,
+    help="S3 HTTP retries for transient failures",
+)
+parser.add_argument(
     "--chtimeout",
     "--ch-timeout",
     "--send-receive-timeout",
@@ -306,7 +408,7 @@ parser.add_argument(
     "--create-database-flag",
     "--createdatabase-flag",
     dest="createdatabase_flag",
-    type=bool,
+    type=coerce_bool,
     default=False,
     help="create database for collecttable",
 )
@@ -322,7 +424,7 @@ parser.add_argument(
     "--drop-collecttable-flag",
     "--dropcollecttable-flag",
     dest="drop_collecttable_flag",
-    type=bool,
+    type=coerce_bool,
     default=False,
     help="drop collecttable and recreate; beware of ClickHouse DROP TABLE constraints",
 )
@@ -330,7 +432,7 @@ parser.add_argument(
     "--useremoveobjects",
     "--use-remove-objects",
     dest="use_remove_objects",
-    type=bool,
+    type=coerce_bool,
     default=True,
     help="use remove_objects (not supported by GCE). Set it to false to use remove_object",
 )
@@ -345,7 +447,7 @@ parser.add_argument(
 parser.add_argument(
     "--interactive-flag",
     dest="interactive_flag",
-    type=bool,
+    type=coerce_bool,
     default=True,
     help="confirm deleting",
 )
@@ -359,7 +461,7 @@ parser.add_argument(
 parser.add_argument(
     "--verboseflag",
     "--verbose-flag",
-    type=bool,
+    type=coerce_bool,
     dest="verbose_flag",
     default=False,
     help="debug output",
@@ -374,7 +476,7 @@ parser.add_argument(
 parser.add_argument(
     "--debugflag",
     "--debug-flag",
-    type=bool,
+    type=coerce_bool,
     dest="debug_flag",
     default=False,
     help="trace output (more verbose)",
@@ -386,7 +488,7 @@ parser.add_argument(
     "--silentflag",
     "--silent-flag",
     dest="silent_flag",
-    type=bool,
+    type=coerce_bool,
     default=False,
     help="no log",
 )
@@ -407,6 +509,39 @@ parser.add_argument("--cfg", action=ActionConfigFile)
 
 args = parser.parse_args()
 
+# Every flag declared with action="store_true" arrives from the environment as a
+# raw string, and every non-empty string is truthy. Normalise all boolean
+# options in one place, immediately after parsing, so the rest of the program
+# can rely on real bools.
+BOOLEAN_DESTS = (
+    "s3secure_flag",
+    "use_remove_objects",
+    "keepdata_flag",
+    "collectonly_flag",
+    "usecollected_flag",
+    "dryrun_flag",
+    "order_by_objpath",
+    "createdatabase_flag",
+    "drop_collecttable_flag",
+    "verbose_flag",
+    "debug_flag",
+    "silent_flag",
+    "listoptions",
+)
+
+for _dest in BOOLEAN_DESTS:
+    if not hasattr(args, _dest):
+        continue
+    _raw = getattr(args, _dest)
+    try:
+        setattr(args, _dest, coerce_bool(_raw))
+    except ValueError:
+        parser.error(
+            f"invalid boolean value {_raw!r} for {_dest} "
+            f"(environment variable S3GC_{_dest.upper()}); "
+            "use one of true/false, yes/no, on/off, 1/0"
+        )
+
 if args.listoptions:
     with redirect_stdout(StringIO()) as f:
         try:
@@ -422,7 +557,7 @@ if args.listoptions:
         if key in ["listoptions"]:
             continue
         if backslash:
-            print(" \\ ")
+            print(" \\")
         print(f" S3GC_{key.upper()}={value}", end="")
 
         backslash = True
@@ -446,10 +581,14 @@ class LogFormatter(logging.Formatter):
 
     def get_filter_strings():
         filter_strings = []
-        if len(args.chpass) > 3:
-            filter_strings.append(args.chpass)
-        if len(args.s3secretkey) > 3:
-            filter_strings.append(args.s3secretkey)
+        for secret in [
+            args.chpass,
+            args.s3accesskey,
+            args.s3secretkey,
+            args.s3sessiontoken,
+        ]:
+            if len(secret) > 3:
+                filter_strings.append(secret)
         return filter_strings
 
     filter_strings = get_filter_strings()
@@ -500,6 +639,49 @@ minio_client = None
 ch_client = None
 
 
+class S3DeletionError(RuntimeError):
+    """A delete failed after successful deletions were checkpointed."""
+
+
+def _query_single_value(query):
+    result = ch_client.query(query)
+    if not result.result_rows or not result.result_rows[0]:
+        raise RuntimeError(f"ClickHouse returned no result for preflight query: {query}")
+    return result.result_rows[0][0]
+
+
+def preflight_cluster():
+    """Make destructive cluster-wide cleanup fail closed when topology is unexpected."""
+    if not args.expected_replicas:
+        return
+    if not args.clustername:
+        raise ValueError("--expected-replicas requires --cluster")
+
+    actual_cluster = _query_single_value("SELECT getMacro('cluster')")
+    if actual_cluster != args.clustername:
+        raise RuntimeError(
+            f"cluster preflight failed: expected local cluster macro {args.clustername!r}, "
+            f"got {actual_cluster!r}"
+        )
+
+    cluster_name = args.clustername.replace("'", "\\\\'")
+    actual_replicas = _query_single_value(
+        f"SELECT count() FROM clusterAllReplicas('{cluster_name}', system.one)"
+    )
+    if actual_replicas != args.expected_replicas:
+        raise RuntimeError(
+            f"replica preflight failed: expected {args.expected_replicas}, got {actual_replicas}"
+        )
+
+    logger.info(
+        f"cluster preflight passed: cluster={args.clustername}, replicas={actual_replicas}"
+    )
+
+
+class UserVisibleError(RuntimeError):
+    """An operator-facing failure: reported without a traceback."""
+
+
 def connect_to_ch():
     logger.info(
         f"Connecting to ClickHouse, host={args.chhost}, port={args.chport}, username={args.chuser}, password={args.chpass}, s3path={args.s3path}, bucket={args.s3bucket}, s3path={args.s3path}"
@@ -514,23 +696,182 @@ def connect_to_ch():
     )
 
 
+def resolve_static_s3_credentials():
+    if bool(args.s3accesskey) != bool(args.s3secretkey):
+        raise ValueError("s3accesskey and s3secretkey must be specified together")
+    if args.s3sessiontoken and not args.s3accesskey:
+        raise ValueError("s3sessiontoken requires s3accesskey and s3secretkey")
+
+    if args.s3accesskey:
+        return args.s3accesskey, args.s3secretkey, args.s3sessiontoken or None, args.s3region, "static"
+
+    return None, None, None, args.s3region, "anonymous"
+
+
+def resolve_aws_s3_credentials():
+    if args.s3accesskey or args.s3secretkey or args.s3sessiontoken:
+        raise ValueError("s3auth=aws cannot be combined with explicit S3 access keys")
+
+    try:
+        import boto3
+    except ImportError as exc:
+        raise UserVisibleError("boto3 is required for s3auth=aws") from exc
+
+    session = boto3.Session(
+        profile_name=args.s3profile or None,
+        region_name=args.s3region,
+    )
+    credentials = session.get_credentials()
+    if credentials is None:
+        profile_hint = f" profile {args.s3profile}" if args.s3profile else ""
+        raise UserVisibleError(f"unable to resolve AWS credentials{profile_hint}")
+
+    frozen_credentials = credentials.get_frozen_credentials()
+    if not frozen_credentials.access_key or not frozen_credentials.secret_key:
+        profile_hint = f" profile {args.s3profile}" if args.s3profile else ""
+        raise UserVisibleError(f"resolved AWS credentials{profile_hint} are incomplete")
+
+    return (
+        frozen_credentials.access_key,
+        frozen_credentials.secret_key,
+        frozen_credentials.token,
+        args.s3region or session.region_name,
+        "aws",
+    )
+
+
+AUTH_MODES = ("static", "aws", "iam")
+
+
+def resolve_iam_s3_credentials():
+    """Workload identity via MinIO's own provider — IRSA, IMDS or ECS task role.
+
+    Kept as a first-class mode rather than folded into `aws`: it needs no boto3,
+    and it is what the validated Kubernetes deployments use. `credentials=` is
+    returned instead of keys so MinIO can refresh the temporary credentials.
+    """
+    return None, None, None, args.s3region, "iam"
+
+
+def resolve_s3_credentials():
+    auth_mode = args.s3auth.lower()
+    if auth_mode not in AUTH_MODES:
+        raise ValueError(f"s3auth must be one of {', '.join(AUTH_MODES)}")
+
+    # Implied modes. Both are conveniences, so a contradiction is an error rather
+    # than a silent winner: picking one would send credentials nobody asked for.
+    if args.s3profile:
+        if auth_mode not in ("static", "aws"):
+            raise ValueError(f"s3profile implies s3auth=aws, which conflicts with s3auth={auth_mode}")
+        auth_mode = "aws"
+    if auth_mode == "aws":
+        return resolve_aws_s3_credentials()
+    if auth_mode == "iam":
+        return resolve_iam_s3_credentials()
+
+    return resolve_static_s3_credentials()
+
+
 def connect_to_s3():
     if args.s3secure_flag:
         logger.debug(f"using SSL certificate {args.s3sslcertfile}")
         os.environ["SSL_CERT_FILE"] = args.s3sslcertfile
 
+    access_key, secret_key, session_token, s3_region, s3_auth = resolve_s3_credentials()
     logger.info(
-        f"Connecting to S3, host:port={args.s3ip}:{args.s3port}, access_key={args.s3accesskey}, secret_key={args.s3secretkey}, secure={args.s3secure_flag}, region={args.s3region}"
+        f"Connecting to S3, host:port={args.s3ip}:{args.s3port}, auth={s3_auth}, "
+        f"secure={args.s3secure_flag}, region={s3_region}"
     )
+
+    # Google Cloud Storage's S3-compatible API has no batch DeleteObjects, so
+    # remove_objects() fails there. Switch to the per-object path automatically
+    # rather than letting every delete fail at run time.
+    if "storage.googleapis.com" in args.s3ip and args.use_remove_objects:
+        logger.warning(
+            "GCS endpoint detected: batch remove_objects is not supported there, "
+            "falling back to per-object remove_object. This is markedly slower "
+            "(one request per object); pass --use-remove-objects false to silence this."
+        )
+        args.use_remove_objects = False
     global minio_client
+    connection_options = {
+        "secure": args.s3secure_flag,
+        "region": s3_region,
+        "http_client": urllib3.PoolManager(
+            cert_reqs="CERT_NONE",
+            timeout=urllib3.Timeout(
+                connect=args.s3_connect_timeout, read=args.s3_read_timeout
+            ),
+            retries=urllib3.Retry(
+                total=args.s3_retries,
+                connect=args.s3_retries,
+                read=args.s3_retries,
+                status=args.s3_retries,
+                backoff_factor=1,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=frozenset({"DELETE", "GET", "HEAD", "POST"}),
+            ),
+        ),
+    }
+    if s3_auth == "iam":
+        # Hand MinIO the provider, not frozen keys, so it can refresh the
+        # temporary credentials for the lifetime of a long collect or delete.
+        connection_options["credentials"] = IamAwsProvider()
+    else:
+        # static, aws and anonymous all arrive here as resolved values;
+        # session_token is None unless temporary credentials were supplied.
+        connection_options["access_key"] = access_key
+        connection_options["secret_key"] = secret_key
+        connection_options["session_token"] = session_token
     minio_client = Minio(
         f"{args.s3ip}:{args.s3port}",
-        access_key=args.s3accesskey,
-        secret_key=args.s3secretkey,
-        secure=args.s3secure_flag,
-        region=args.s3region,
-        http_client=urllib3.PoolManager(cert_reqs="CERT_NONE"),
+        **connection_options,
     )
+
+
+def remove_objects_reconnecting(batch_rows):
+    """Delete one batch, reconnecting once if the S3 transport is stale.
+
+    DeleteObject requests are idempotent: retrying after an interrupted response
+    can only leave the object absent, never delete a different object.
+    """
+    for attempt in range(2):
+        try:
+            return list(
+                minio_client.remove_objects(
+                    args.s3bucket, [DeleteObject(row[0]) for row in batch_rows]
+                )
+            )
+        except (S3Error, urllib3.exceptions.HTTPError) as exc:
+            if attempt:
+                raise
+            logger.warning(
+                "S3 delete transport failed (%s); reconnecting and retrying once", exc
+            )
+            connect_to_s3()
+
+    raise AssertionError("unreachable")
+
+
+def format_s3_list_error(exc):
+    code = getattr(exc, "code", "unknown")
+    message = getattr(exc, "message", str(exc))
+    profile_arg = f" --profile {args.s3profile}" if args.s3profile else ""
+    return (
+        f"unable to list S3 objects for bucket={args.s3bucket!r}, prefix={args.s3path!r}: "
+        f"{code}: {message}. "
+        f"s3gc collection requires s3:ListBucket on arn:aws:s3:::{args.s3bucket} "
+        f"for this prefix, even with --dry-run. Verify the same credentials with: "
+        f"aws sts get-caller-identity{profile_arg}; "
+        f"aws s3api list-objects-v2 --bucket {args.s3bucket} --prefix {args.s3path} --max-keys 1{profile_arg}"
+    )
+
+
+def next_s3_object(objects):
+    try:
+        return next(objects)
+    except S3Error as exc:
+        raise UserVisibleError(format_s3_list_error(exc)) from exc
 
 
 def do_collect():
@@ -568,9 +909,12 @@ def do_collect():
         objs = []
         for batch_element in range(0, args.collectbatchsize):
             try:
-                obj = next(objects)
+                obj = next_s3_object(objects)
                 delta = datetime.datetime.now(datetime.timezone.utc) - obj.last_modified
-                hours = int(delta.seconds / 3600)
+                # total_seconds(), not .seconds: the latter is the sub-day
+                # remainder (0..86399), so any object older than a day reported
+                # at most 23 hours and --age 24 collected nothing at all.
+                hours = int(delta.total_seconds() // 3600)
                 if hours >= args.age:
                     objs.append([obj.object_name, obj.size, obj.last_modified, True])
                     total_size += obj.size
@@ -594,7 +938,38 @@ def do_collect():
     )
 
 
+def check_samples_match_partitioning():
+    """Warn when --samples disagrees with the aux table's PARTITION BY.
+
+    The table is created as PARTITION BY CRC32(objpath) % <samples> at COLLECT
+    time. Running the use phase with a different --samples silently loses
+    partition pruning: on one production cluster the matching case scanned a
+    sample in ~2 min where the mismatching case took ~26 min.
+    """
+    try:
+        rows = ch_client.query(
+            "SELECT partition_key FROM system.tables "
+            f"WHERE database = currentDatabase() AND name = '{tname.strip('`').split('.')[-1]}'"
+        ).result_rows
+    except Exception as exc:
+        logger.debug(f"could not read partition_key for {tname}: {exc}")
+        return
+    if not rows or not rows[0][0]:
+        return
+    partition_key = rows[0][0]
+    expected = f"% {args.samples}"
+    if "CRC32" in partition_key and expected not in partition_key.replace(" ", " "):
+        logger.warning(
+            f"--samples {args.samples} does not match the auxiliary table's "
+            f"partitioning ({partition_key}). Partition pruning will be lost; "
+            "use the same --samples value that the collect phase used."
+        )
+
+
 def do_use():
+    if not args.dryrun_flag:
+        preflight_cluster()
+
     srdp = "system.remote_data_paths"
     if args.clustername:
         srdp = f"clusterAllReplicas('{args.clustername}', {srdp})"
@@ -609,9 +984,18 @@ def do_use():
         logger.info(f"exception selecting from {tname}, {exc}")
         pass
     if num_rows == 0:
-        logger.info(f"auxiliary table {tname} does not exist or empty, nothing to do")
+        # Exiting 0 here reads as success, but with --usecollected an absent or
+        # empty auxiliary table means the collect never ran, ran against another
+        # host, or was truncated. The table is a NODE-LOCAL ReplacingMergeTree, so
+        # a load-balanced ClickHouse Service can collect on one replica and land
+        # here on the other. Fail loudly instead of reporting a clean bucket.
+        raise RuntimeError(
+            f"auxiliary table {tname} does not exist or is empty on {args.chhost}. "
+            "Run the collect phase first, and make sure every phase targets the SAME "
+            "replica: the table is node-local, so a load-balanced Service will not do."
+        )
 
-        graceful_exit()
+    check_samples_match_partitioning()
 
     def make_antijoin(calc_only=False, sample=None):
         after_condition = f"AND s3o.objpath > {args.useafter} " if args.useafter else ""
@@ -622,11 +1006,12 @@ def do_use():
         if not calc_only:
             sample_condition = f"CRC32(s3o.objpath) % {args.samples} = {sample} AND "
 
+        order_by = " ORDER BY s3o.objpath" if args.order_by_objpath else ""
         antijoin = f"""
         SELECT s3o.objpath, s3o.size as size, s3o.last_modified as last_modified FROM {tname} AS s3o LEFT ANTI JOIN {srdp} AS rdp ON
         (rdp.remote_path = s3o.objpath AND rdp.disk_name='{args.s3diskname}')
         WHERE {sample_condition} s3o.active=true {after_condition} {age_condition}
-        ORDER BY s3o.objpath {limit} SETTINGS final = 1"""
+        {order_by} {limit} SETTINGS final = 1"""
 
         if calc_only:
             countantijoin = f"SELECT COUNT(1), SUM(size) FROM ({antijoin}) q"
@@ -662,50 +1047,94 @@ def do_use():
 
     num_removed = 0
     total_size = 0
-    objs = []
-
+    if not args.dryrun_flag and args.deletebatchsize < 1:
+        raise ValueError("--deletebatchsize must be a positive integer")
     for sample in range(0, args.samples):
         antijoin = make_antijoin(sample=sample)
         logger.info(f"antijoin {antijoin}")
 
         with ch_client.query_row_block_stream(antijoin) as stream:
             for block in stream:
-                objects_to_remove = []
-                object_to_remove = []
+                selected_rows = []
                 for row in block:
                     logger.debug(
                         f"{'removing' if not args.dryrun_flag else 'would remove if no dryrun flag'}  {row[0]} of size {row[1]}"
                     )
+                    selected_rows.append(row)
+
+                if args.dryrun_flag:
+                    num_removed += len(selected_rows)
+                    total_size += sum(row[1] for row in selected_rows)
+                    continue
+
+                for offset in range(0, len(selected_rows), args.deletebatchsize):
+                    batch_rows = selected_rows[offset : offset + args.deletebatchsize]
+                    errors = []
                     if args.use_remove_objects:
-                        objects_to_remove.append(DeleteObject(row[0]))
-                    else:
-                        object_to_remove.append(row[0])
-                    objs.append([row[0], row[1], row[2], False])
-                    total_size += row[1]
-                if not args.dryrun_flag:
-                    if args.use_remove_objects:
-                        errors = minio_client.remove_objects(
-                            args.s3bucket, objects_to_remove
-                        )
+                        errors = remove_objects_reconnecting(batch_rows)
                         for error in errors:
                             logger.info(f"error occurred when deleting object via remove_objects {error}")
+
+                        failed_names = {
+                            getattr(error, "object_name", None) or getattr(error, "name", None)
+                            for error in errors
+                        }
+                        if None in failed_names:
+                            # Do not tombstone any object for an uncorrelatable batch error.
+                            successful_rows = []
+                        else:
+                            successful_rows = [
+                                row for row in batch_rows if row[0] not in failed_names
+                            ]
                     else:
-                        for object_path in object_to_remove:
+                        successful_rows = []
+                        for row in batch_rows:
                             try:
-                                minio_client.remove_object(
-                                    args.s3bucket, object_path
-                                )
+                                minio_client.remove_object(args.s3bucket, row[0])
+                                successful_rows.append(row)
                             except Exception as error:
-                                logger.info(f"error occurred when deleting object {object_path} via remove_object {error}")
+                                logger.info(f"error occurred when deleting object {row[0]} via remove_object {error}")
+                                errors.append(error)
 
-                num_removed += len(objects_to_remove)
+                    if successful_rows:
+                        tombstones = [
+                            [row[0], row[1], row[2], False] for row in successful_rows
+                        ]
+                        ch_client.insert(
+                            tname,
+                            tombstones,
+                            column_names=["objpath", "size", "last_modified", "active"],
+                        )
+                        num_removed += len(successful_rows)
+                        total_size += sum(row[1] for row in successful_rows)
+                        logger.info(
+                            f"delete checkpoint: {num_removed} objects / {total_size} bytes removed so far"
+                        )
 
-        if not args.dryrun_flag:
-            ch_client.insert(tname, objs, column_names=["objpath", "size", "last_modified", "active"])
+                    if errors:
+                        raise S3DeletionError(
+                            f"{len(errors)} S3 deletion error(s); successful deletes were checkpointed"
+                        )
 
+    # "this attempt", not "this run": a resumed run leaves earlier attempts'
+    # deletions out of these counters, so the line understated one aps1 run by
+    # 16.61 TiB. The cumulative truth is the tombstone count in the aux table.
     logger.info(
-        f"{num_removed} objects of total size {total_size} {'are removed' if not args.dryrun_flag else 'would be removed but for dryrun flag'}"
+        f"{num_removed} objects of total size {total_size} "
+        f"{'are removed' if not args.dryrun_flag else 'would be removed but for dryrun flag'} "
+        "in this attempt"
     )
+    if not args.dryrun_flag:
+        try:
+            cumulative = ch_client.query(
+                f"SELECT count(), sum(size) FROM {tname} FINAL WHERE active = false"
+            ).result_rows[0]
+            logger.info(
+                f"cumulative for this auxiliary table: {cumulative[0]} objects / "
+                f"{cumulative[1]} bytes tombstoned"
+            )
+        except Exception as exc:  # never fail a completed run over a status query
+            logger.info(f"could not read cumulative tombstone count: {exc}")
 
     if not args.keepdata_flag and not args.dryrun_flag:
         logger.info(f"truncating {tname}")
@@ -713,15 +1142,22 @@ def do_use():
 
 
 def main():
-    connect_to_ch()
-    if not (args.usecollected_flag and args.dryrun_flag):
-        connect_to_s3()
-    if not args.usecollected_flag:
-        do_collect()
-    if not args.collectonly_flag:
-        do_use()
+    try:
+        connect_to_ch()
+        if not (args.usecollected_flag and args.dryrun_flag):
+            connect_to_s3()
+        if not args.usecollected_flag:
+            do_collect()
+        if not args.collectonly_flag:
+            do_use()
 
-    graceful_exit()
+        graceful_exit()
+    except UserVisibleError as exc:
+        if args.debug_flag:
+            logger.exception(str(exc))
+        else:
+            logger.error(str(exc))
+        sys.exit(1)
 
 
 if __name__ == "__main__":

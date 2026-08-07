@@ -1,0 +1,105 @@
+name: Container
+
+# Publishes a PUBLIC multi-architecture image to GHCR.
+#
+# Public on purpose: a private image forces every operator to copy a registry
+# credential into the customer's namespace as an imagePullSecret and remember to
+# delete it afterwards. A public image removes that step entirely.
+#
+# Multi-arch on purpose: ClickHouse node pools are frequently arm64 (one customer
+# cluster is 5x arm64 + 1x amd64), and an amd64-only image can only ever schedule
+# on a fraction of such a pool.
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+    tags: ['v*.*.*']
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: altinity/s3gc
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install --disable-pip-version-check -r requirements.txt -r requirements-dev.txt
+      # Development-cluster tests require explicit credentials and are never
+      # part of the offline pull-request gate.
+      - run: pytest -v -m "not dev_cluster"
+      # The renderer is part of the contract: it refuses images that are not
+      # digest-pinned, so a broken template breaks every deployment.
+      - run: python deploy/kubernetes/render.py deploy/kubernetes/example.env > "$GITHUB_WORKSPACE/.s3gc-job.yaml"
+      # Client-side kubectl validation requires a Kubernetes API server for
+      # OpenAPI discovery. Kubeconform validates the rendered standard-resource
+      # manifest against pinned Kubernetes schemas without cluster access.
+      - name: Rendered manifest must conform to Kubernetes schemas
+        uses: docker://ghcr.io/yannh/kubeconform@sha256:85dbef6b4b312b99133decc9c6fc9495e9fc5f92293d4ff3b7e1b30f5611823c
+        with:
+          entrypoint: /kubeconform
+          args: -strict -summary /github/workspace/.s3gc-job.yaml
+
+  publish:
+    needs: test
+    # Fork pull requests cannot write packages, and there is nothing to publish
+    # from them anyway.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          # Automatic token: this repository lives in the Altinity organisation,
+          # so it already grants packages:write for ghcr.io/altinity/*.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        id: image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Record immutable image reference
+        # render.py requires IMAGE to be digest-pinned, so this is the exact
+        # string an operator pastes into their .env file.
+        run: |
+          {
+            echo "### Image published"
+            echo '```'
+            echo "IMAGE=${REGISTRY}/${IMAGE_NAME}@${{ steps.image.outputs.digest }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,96 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: "${JOB_NAME}"
+  namespace: "${NAMESPACE}"
+  labels:
+    app.kubernetes.io/name: s3gc
+    app.kubernetes.io/component: object-storage-garbage-collection
+    s3gc.altinity.com/phase: "${PHASE}"
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: ${ACTIVE_DEADLINE_SECONDS}
+  ttlSecondsAfterFinished: ${TTL_SECONDS_AFTER_FINISHED}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: s3gc
+        app.kubernetes.io/component: object-storage-garbage-collection
+        s3gc.altinity.com/phase: "${PHASE}"
+    spec:
+      restartPolicy: Never
+      serviceAccountName: "${SERVICE_ACCOUNT}"
+      imagePullSecrets:
+        - name: "${IMAGE_PULL_SECRET}"
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: s3gc
+          image: "${IMAGE}"
+          imagePullPolicy: IfNotPresent
+          command: ["/app/kubernetes-entrypoint.sh"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "500m"
+              memory: ${MEMORY_REQUEST}
+            limits:
+              cpu: "2"
+              memory: ${MEMORY_LIMIT}
+          envFrom:
+            - secretRef:
+                name: "${CREDENTIALS_SECRET}"
+          env:
+            - name: S3GC_PHASE
+              value: "${PHASE}"
+            - name: S3GC_DELETE_CONFIRMATION
+              value: "${DELETE_CONFIRMATION}"
+            - name: S3GC_CHHOST
+              value: "${CHHOST}"
+            - name: S3GC_CHPORT
+              value: "${CHPORT}"
+            - name: S3GC_CLUSTERNAME
+              value: "${CLUSTERNAME}"
+            - name: S3GC_EXPECTED_REPLICAS
+              value: "${EXPECTED_REPLICAS}"
+            - name: S3GC_COLLECTTABLEPREFIX
+              value: "${COLLECTTABLEPREFIX}"
+            - name: S3GC_S3IP
+              value: "${S3IP}"
+            - name: S3GC_S3PORT
+              value: "${S3PORT}"
+            - name: S3GC_S3BUCKET
+              value: "${S3BUCKET}"
+            - name: S3GC_S3PATH
+              value: "${S3PATH}"
+            - name: S3GC_S3REGION
+              value: "${S3REGION}"
+            - name: S3GC_S3SECURE_FLAG
+              value: "${S3SECURE_FLAG}"
+            - name: S3GC_S3DISKNAME
+              value: "${S3DISKNAME}"
+            - name: S3GC_S3AUTH
+              value: "${S3AUTH}"
+            - name: S3GC_S3PROFILE
+              value: "${S3PROFILE}"
+            - name: S3GC_SAMPLES
+              value: "${SAMPLES}"
+            - name: S3GC_DELETEBATCHSIZE
+              value: "${DELETE_BATCH_SIZE}"
+            - name: S3GC_USEAGE
+              value: "${USEAGE_HOURS}"
+            - name: S3GC_ORDER_BY_OBJPATH
+              value: "${ORDER_BY_OBJPATH}"
+            - name: S3GC_CHTIMEOUT
+              value: "${ACTIVE_DEADLINE_SECONDS}"
+            - name: S3GC_VERBOSE_FLAG
+              value: "${VERBOSE}"

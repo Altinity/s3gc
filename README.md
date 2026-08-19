@@ -62,6 +62,28 @@ Run a dry-run first:
 For a production or customer cleanup, use the Kubernetes procedure below rather
 than a one-line delete command.
 
+## AI-agent skill
+
+This repository includes a reusable operational skill at
+[`skills/altinity-clickhouse-s3gc`](skills/altinity-clickhouse-s3gc/). It guides
+agents through the same guarded production workflow documented here, including
+per-replica ClickHouse routing, reviewed dry-run results, explicit human delete
+approval, and final verification.
+
+Install it by symlinking or copying the directory into your agent's skills
+directory. For example, for Codex:
+
+```bash
+mkdir -p ~/.codex/skills
+ln -s /path/to/s3gc/skills/altinity-clickhouse-s3gc \
+      ~/.codex/skills/altinity-clickhouse-s3gc
+```
+
+For Claude Code, substitute `~/.claude/skills`. Invoke it with
+`$altinity-clickhouse-s3gc` or ask the agent to plan a reviewed `s3gc` cleanup.
+The skill does not permit an agent to supply the deletion confirmation; an
+authorized human must approve the reviewed dry-run result.
+
 ## Direct script examples
 
 The following is a non-secret target configuration. Replace every

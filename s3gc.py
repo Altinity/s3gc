@@ -637,6 +637,9 @@ else:
 
 minio_client = None
 ch_client = None
+# A second ClickHouse client, used only for writes issued while a result
+# stream from ch_client is still open. See connect_to_ch().
+ch_writer = None
 
 
 class S3DeletionError(RuntimeError):
@@ -686,14 +689,30 @@ def connect_to_ch():
     logger.info(
         f"Connecting to ClickHouse, host={args.chhost}, port={args.chport}, username={args.chuser}, password={args.chpass}, s3path={args.s3path}, bucket={args.s3bucket}, s3path={args.s3path}"
     )
-    global ch_client
-    ch_client = clickhouse_connect.get_client(
-        host=args.chhost,
-        port=args.chport,
-        username=args.chuser,
-        password=args.chpass,
-        send_receive_timeout=args.chtimeout,
-    )
+    global ch_client, ch_writer
+
+    def new_client():
+        return clickhouse_connect.get_client(
+            host=args.chhost,
+            port=args.chport,
+            username=args.chuser,
+            password=args.chpass,
+            send_receive_timeout=args.chtimeout,
+        )
+
+    ch_client = new_client()
+    # Deliberately a second connection, not a convenience.
+    #
+    # clickhouse-connect gives each client its own auto-generated session_id, and
+    # ClickHouse allows one query at a time per session. do_use() holds ch_client's
+    # session for the whole anti-join while it consumes query_row_block_stream, and
+    # insert() issues its own DESCRIBE TABLE before writing. On the shared client
+    # that DESCRIBE is a second concurrent query on a held session, which the server
+    # rejects with SESSION_IS_LOCKED (373), killing the delete phase after its first
+    # successful batch — objects already gone from S3, no tombstone recorded.
+    #
+    # Keep tombstone writes on this client. Do not "simplify" it away.
+    ch_writer = new_client()
 
 
 def resolve_static_s3_credentials():
@@ -1100,7 +1119,9 @@ def do_use():
                         tombstones = [
                             [row[0], row[1], row[2], False] for row in successful_rows
                         ]
-                        ch_client.insert(
+                        # ch_writer, not ch_client: the anti-join stream above still
+                        # holds ch_client's session. See connect_to_ch().
+                        ch_writer.insert(
                             tname,
                             tombstones,
                             column_names=["objpath", "size", "last_modified", "active"],

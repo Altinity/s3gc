@@ -17,7 +17,51 @@ expose.
 
 Changes below are on `feature/kubernetes-job-runner` and not yet released.
 
+### Added
+
+- **`USETOTAL` is now settable from the Kubernetes Job template**, so a use
+  phase can be capped at a few thousand objects. `--usetotal` already existed on
+  the command line and, through `env_prefix="S3GC"`, in the environment; it was
+  simply unreachable for anyone deploying with the renderer, whose only option
+  was an unbounded multi-hour run.
+
+  This is the missing safety rail for a first delete against a newly published
+  image or an unfamiliar cluster: a bounded run exercises anti-join, S3 deletion
+  and tombstone write-back end to end in minutes. The session-lock defect above
+  would have been caught by one, for the price of minutes instead of a run that
+  died partway with objects already removed.
+
+  The key is optional and renders no environment variable when empty, because
+  `S3GC_USETOTAL` is parsed as an integer and an empty string would fail the run
+  at startup. Existing environment files render unchanged.
+
 ### Fixed
+
+- **The delete phase died on its first batch with `SESSION_IS_LOCKED` (ClickHouse
+  error 373), after the objects were already gone from S3.** `connect_to_ch()`
+  built a single `clickhouse_connect` client, which the driver gives an
+  auto-generated `session_id`, and ClickHouse permits one query at a time per
+  session. `do_use()` holds that session for the entire anti-join while it
+  consumes `query_row_block_stream`, and `insert()` issues its own
+  `DESCRIBE TABLE` before writing — a second concurrent query on the held
+  session. The server rejected it, the job exited non-zero, and up to
+  `--deletebatchsize` objects were deleted with no tombstone recorded, so a
+  resumed run could not know they were done.
+
+  Tombstone writes now go to a second client created in the same call. The
+  connection is deliberate, not incidental: reverting to a shared client
+  reintroduces the defect silently, because it only fires once a *real* deletion
+  succeeds and the write-back is attempted.
+
+  Evidence and why it went unnoticed: every earlier delete that reclaimed data
+  ran with `--order-by-objpath`, which makes the server sort the whole result
+  before streaming it, and ran against ClickHouse 25.x. The first run without
+  global ordering — the documented default for Kubernetes Jobs — hit the lock 78
+  minutes in, on the first block the anti-join produced. Whether ordering or the
+  server version is what previously masked it was not established; the fix does
+  not depend on the answer, and relying on either to keep the session free was
+  accidental rather than designed.
+
 
 - **`--age` silently collected nothing for anything older than a day.** The
   filter used `timedelta.seconds`, the sub-day remainder (0..86399), so computed

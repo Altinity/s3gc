@@ -114,6 +114,7 @@ def test_batch_errors_checkpoint_only_confirmed_deletes(
     client = FakeCH(blocks=[[("good-object", 10, "time"), ("bad-object", 20, "time")]])
     monkeypatch.setitem(namespace, "args", args_factory())
     monkeypatch.setitem(namespace, "ch_client", client)
+    monkeypatch.setitem(namespace, "ch_writer", client)
     monkeypatch.setitem(namespace, "minio_client", FailingMinio())
 
     with pytest.raises(s3gc_module["S3DeletionError"]):
@@ -140,6 +141,7 @@ def test_delete_batches_are_checkpointed_independently(
 
     monkeypatch.setitem(namespace, "args", args_factory(deletebatchsize=1))
     monkeypatch.setitem(namespace, "ch_client", client)
+    monkeypatch.setitem(namespace, "ch_writer", client)
     monkeypatch.setitem(namespace, "minio_client", SuccessfulMinio())
     s3gc_module["do_use"]()
 
@@ -147,6 +149,107 @@ def test_delete_batches_are_checkpointed_independently(
         [["object-a", 10, "time", False]],
         [["object-b", 20, "time", False]],
     ]
+
+
+class SessionIsLocked(RuntimeError):
+    """Stand-in for ClickHouse error 373."""
+
+
+class StreamingCH(FakeCH):
+    """A client that rejects writes while one of its result streams is open.
+
+    Models ClickHouse's one-query-per-session rule. clickhouse-connect gives
+    each client an auto-generated session_id, and `insert()` issues its own
+    `DESCRIBE TABLE` before writing — a second concurrent query on the session
+    the anti-join stream is still holding.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.streaming = False
+
+    def query_row_block_stream(self, query):
+        inner = super().query_row_block_stream(query)
+        owner = self
+
+        class Guarded:
+            def __enter__(self):
+                owner.streaming = True
+                return inner.__enter__()
+
+            def __exit__(self, *exc):
+                owner.streaming = False
+                return inner.__exit__(*exc)
+
+        return Guarded()
+
+    def insert(self, *args, **kwargs):
+        if self.streaming:
+            raise SessionIsLocked("Session is locked by a concurrent client")
+        return super().insert(*args, **kwargs)
+
+
+def test_tombstones_are_written_off_the_streaming_session(
+    s3gc_module, args_factory, monkeypatch
+):
+    """Regression: the delete phase died on its first batch with SESSION_IS_LOCKED.
+
+    Objects were already gone from S3 when the tombstone insert was rejected, so
+    the deletion went unrecorded and the job could not resume cleanly. Tombstones
+    must therefore be written on a client that is not holding the anti-join stream.
+    """
+    namespace = s3gc_module["do_use"].__globals__
+    streaming = StreamingCH(blocks=[[("object-a", 10, "time")]])
+    writer = FakeCH()
+
+    class SuccessfulMinio:
+        def remove_objects(self, bucket, objects):
+            return iter(())
+
+    monkeypatch.setitem(namespace, "args", args_factory())
+    monkeypatch.setitem(namespace, "ch_client", streaming)
+    monkeypatch.setitem(namespace, "ch_writer", writer)
+    monkeypatch.setitem(namespace, "minio_client", SuccessfulMinio())
+
+    s3gc_module["do_use"]()
+
+    assert streaming.inserts == []
+    assert [insert[1] for insert in writer.inserts] == [
+        [["object-a", 10, "time", False]]
+    ]
+
+
+def test_connect_to_ch_builds_a_separate_writer_client(s3gc_module, monkeypatch):
+    """The two clients must be distinct, or the session lock comes straight back."""
+    namespace = s3gc_module["connect_to_ch"].__globals__
+    built = []
+
+    class FakeConnect:
+        @staticmethod
+        def get_client(**kwargs):
+            client = object()
+            built.append(client)
+            return client
+
+    monkeypatch.setitem(namespace, "clickhouse_connect", FakeConnect)
+    monkeypatch.setitem(
+        namespace,
+        "args",
+        types.SimpleNamespace(
+            chhost="host",
+            chport=8123,
+            chuser="user",
+            chpass="pass",
+            chtimeout=60,
+            s3path="path",
+            s3bucket="bucket",
+        ),
+    )
+
+    s3gc_module["connect_to_ch"]()
+
+    assert len(built) == 2
+    assert namespace["ch_client"] is not namespace["ch_writer"]
 
 
 def test_delete_entrypoint_requires_confirmation():
@@ -555,6 +658,81 @@ def test_renderer_omits_empty_image_pull_secret(tmp_path):
     assert result.returncode == 0
     assert "imagePullSecrets" not in result.stdout
     assert 'name: ""' not in result.stdout
+
+
+def test_renderer_omits_unset_usetotal(tmp_path):
+    """An empty USETOTAL must render no variable at all.
+
+    s3gc parses S3GC_USETOTAL as an integer, so `value: ""` would fail the run
+    at startup rather than mean "no limit".
+    """
+    config_path = tmp_path / "full.env"
+    config_path.write_text((ROOT / "deploy/kubernetes/example.env").read_text())
+
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "deploy/kubernetes/render.py"), config_path],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "S3GC_USETOTAL" not in result.stdout
+
+
+def test_renderer_keeps_configured_usetotal(tmp_path):
+    """A bounded trial run must reach the container."""
+    source = (ROOT / "deploy/kubernetes/example.env").read_text()
+    config_path = tmp_path / "bounded.env"
+    config_path.write_text(source.replace("USETOTAL=", "USETOTAL=5000"))
+
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "deploy/kubernetes/render.py"), config_path],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "S3GC_USETOTAL" in result.stdout
+    assert '"5000"' in result.stdout
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "all", "1.5"])
+def test_renderer_rejects_invalid_usetotal(tmp_path, value):
+    source = (ROOT / "deploy/kubernetes/example.env").read_text()
+    config_path = tmp_path / "bad.env"
+    config_path.write_text(source.replace("USETOTAL=", f"USETOTAL={value}"))
+
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "deploy/kubernetes/render.py"), config_path],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 64
+    assert "USETOTAL must be a positive integer when set" in result.stderr
+
+
+def test_renderer_accepts_an_env_file_without_usetotal(tmp_path):
+    """USETOTAL is optional: pre-existing env files must keep rendering."""
+    source = (ROOT / "deploy/kubernetes/example.env").read_text()
+    without = "\n".join(
+        line for line in source.splitlines() if not line.startswith("USETOTAL=")
+    )
+    config_path = tmp_path / "legacy.env"
+    config_path.write_text(without)
+
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "deploy/kubernetes/render.py"), config_path],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "S3GC_USETOTAL" not in result.stdout
 
 
 def test_renderer_keeps_configured_image_pull_secret(tmp_path):

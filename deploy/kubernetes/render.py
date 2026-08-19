@@ -42,6 +42,12 @@ REQUIRED = {
     "VERBOSE",
 }
 DELETE_CONFIRMATION = "DELETE_ORPHANS"
+# Optional keys and their defaults. An empty value renders no environment
+# variable at all, because s3gc parses S3GC_USETOTAL as an integer and would
+# reject an empty string.
+OPTIONAL = {"USETOTAL": ""}
+# Environment variables dropped from the manifest when they render empty.
+OPTIONAL_ENV = ("S3GC_USETOTAL",)
 JOB_NAME_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
 
 
@@ -61,6 +67,8 @@ def read_values(path: Path) -> dict[str, str]:
 
 
 def validate(values: dict[str, str]) -> None:
+    for key, default in OPTIONAL.items():
+        values.setdefault(key, default)
     missing = sorted(REQUIRED - values.keys())
     if missing:
         raise ValueError("missing required values: " + ", ".join(missing))
@@ -90,6 +98,10 @@ def validate(values: dict[str, str]) -> None:
         raise ValueError("VERBOSE must be true or false")
     if values["ORDER_BY_OBJPATH"] not in {"true", "false"}:
         raise ValueError("ORDER_BY_OBJPATH must be true or false")
+    if values["USETOTAL"] and (
+        not values["USETOTAL"].isdigit() or int(values["USETOTAL"]) < 1
+    ):
+        raise ValueError("USETOTAL must be a positive integer when set")
 
 
 def drop_empty_image_pull_secret(manifest: str) -> str:
@@ -113,6 +125,30 @@ def drop_empty_image_pull_secret(manifest: str) -> str:
     return "".join(out)
 
 
+def drop_empty_optional_env(manifest: str) -> str:
+    """Remove optional `S3GC_*` env entries that rendered with an empty value.
+
+    string.Template has no conditionals, so an unset optional key would emit
+    `value: ""`. s3gc parses these as integers and rejects the empty string, so
+    the variable must be absent rather than empty.
+    """
+    lines = manifest.splitlines(keepends=True)
+    out = []
+    index = 0
+    while index < len(lines):
+        name = lines[index].strip()
+        if (
+            any(name == f"- name: {var}" for var in OPTIONAL_ENV)
+            and index + 1 < len(lines)
+            and lines[index + 1].strip() in ('value: ""', "value: ''", "value:")
+        ):
+            index += 2
+            continue
+        out.append(lines[index])
+        index += 1
+    return "".join(out)
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         print(f"usage: {Path(sys.argv[0]).name} CONFIG.env", file=sys.stderr)
@@ -121,7 +157,7 @@ def main() -> int:
         values = read_values(Path(sys.argv[1]))
         validate(values)
         rendered = Template(TEMPLATE.read_text()).substitute(values)
-        sys.stdout.write(drop_empty_image_pull_secret(rendered))
+        sys.stdout.write(drop_empty_optional_env(drop_empty_image_pull_secret(rendered)))
     except (OSError, ValueError, KeyError) as exc:
         print(f"render error: {exc}", file=sys.stderr)
         return 64

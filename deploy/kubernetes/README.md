@@ -100,6 +100,13 @@ Fill `s3gc.env` from `example.env`. For production, start with
 `SAMPLES=4`, `USEAGE_HOURS=24`, `ORDER_BY_OBJPATH=false`, and a 12-hour
 deadline.
 
+Before the first *full* delete against a newly published image or a cluster you
+have not deleted from before, run one bounded delete with `USETOTAL` set to a
+few thousand. It exercises the whole path — anti-join, S3 deletion, tombstone
+write-back — in minutes, and a failure costs you that instead of a multi-hour
+run that dies partway with objects already removed. Clear `USETOTAL` for the
+real run.
+
 ## Run each phase
 
 For each phase, update only `PHASE`, `JOB_NAME`, and (for delete)

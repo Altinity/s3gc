@@ -15,7 +15,26 @@ expose.
 
 ## [Unreleased]
 
-Changes below are on `feature/kubernetes-job-runner` and not yet released.
+Nothing yet.
+
+## [0.6.0] - 2026-08-19
+
+The first release published by CI, and the first image whose provenance can be
+recovered. Everything before it was a hand-built `dev-*` tag.
+
+Two things had to be fixed to get here, both worth recording because neither is
+visible from the code. The release workflow triggers on `tags: ['v*.*.*']`,
+while the repository's tags were `v0.5`, `v_0.1` and `v_0.2` — none can match,
+so the publish job had never run for a release. And `ghcr.io/altinity/s3gc`
+already existed from the manual pushes; a GHCR package created by a user push is
+not linked to its repository, so `GITHUB_TOKEN` was refused with
+`denied: permission_denied: write_package` until the package's *Manage Actions
+access* granted the repository the Write role. A renamed or new package will
+need that grant again.
+
+Images from this release carry `org.opencontainers.image.revision`, so a running
+container maps back to a commit. Identifying which build produced an earlier
+production run previously required comparing log-message formats between runs.
 
 ### Added
 

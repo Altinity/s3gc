@@ -1,0 +1,4 @@
+interface:
+  display_name: "ClickHouse S3 Garbage Collection"
+  short_description: "Safely clean orphaned ClickHouse object-disk data"
+  default_prompt: "Use $altinity-clickhouse-s3gc to plan and execute a reviewed s3gc cleanup."

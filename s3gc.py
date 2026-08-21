@@ -33,6 +33,8 @@ from jsonargparse.typing import Optional
 import urllib3
 import logging
 import datetime
+import socket
+import uuid
 
 usage = """
     s3 garbage collector for ClickHouse
@@ -501,6 +503,30 @@ parser.add_argument(
     help="list all command line options for internal purposes",
 )
 
+parser.add_argument(
+    "--runlog",
+    "--run-log",
+    dest="runlog_flag",
+    type=coerce_bool,
+    default=True,
+    help=(
+        "record durable run events in a ClickHouse table alongside the auxiliary "
+        "table. Pod logs are ephemeral: they are rotated by the kubelet and deleted "
+        "with the Job. Set false to keep stdout as the only record"
+    ),
+)
+parser.add_argument(
+    "--runid",
+    "--run-id",
+    dest="runid",
+    default="",
+    help=(
+        "identifier recorded with every run-log row. Defaults to a generated "
+        "timestamped id; the Kubernetes Job template passes the Job name so a row "
+        "traces back to the Job that wrote it"
+    ),
+)
+
 parser.add_argument("--cfg", action=ActionConfigFile)
 
 
@@ -515,6 +541,7 @@ args = parser.parse_args()
 # can rely on real bools.
 BOOLEAN_DESTS = (
     "s3secure_flag",
+    "runlog_flag",
     "use_remove_objects",
     "keepdata_flag",
     "collectonly_flag",
@@ -635,6 +662,15 @@ elif len(dbparts) == 2:
 else:
     tname = f"`{dbparts[0]}{args.s3diskname}`"
 
+# The run-log table lives beside the auxiliary table and follows the same naming
+# convention, so one COLLECTTABLEPREFIX still identifies one cleanup. Unlike the
+# auxiliary table it is NEVER truncated: it is the durable record of what the
+# cleanup did after the pod and its logs are gone.
+if dbname:
+    log_tname = f"{dbname}.`{dbparts[1]}{args.s3diskname}_log`"
+else:
+    log_tname = f"`{dbparts[0]}{args.s3diskname}_log`"
+
 minio_client = None
 ch_client = None
 # A second ClickHouse client, used only for writes issued while a result
@@ -644,6 +680,142 @@ ch_writer = None
 
 class S3DeletionError(RuntimeError):
     """A delete failed after successful deletions were checkpointed."""
+
+
+##############################################################
+# Durable run log.
+#
+# Pod logs are not a record. The kubelet rotates container output (10Mi by
+# default), so `kubectl logs` cannot return the beginning of a long run, and
+# ttlSecondsAfterFinished deletes the Job and its pods along with everything
+# they printed. A cleanup that reclaimed terabytes left no evidence of what it
+# did once that window closed.
+#
+# So the same events are appended to a ClickHouse table. Three rules, each with
+# a test, because this is bookkeeping attached to an irreversible operation:
+#
+#   1. Writes go on ch_writer, NEVER ch_client. do_use() holds ch_client's
+#      session for the whole anti-join stream, and a second query on a held
+#      session is SESSION_IS_LOCKED (373). Same reason tombstones live there.
+#   2. A logging failure NEVER fails the run. One failure disables the run log
+#      for the remainder of the process rather than retrying every batch: a
+#      delete that is mid-flight must not die over its own audit trail.
+#   3. Messages are redacted through LogFormatter._filter before insert, so a
+#      credential cannot reach a table that outlives the run.
+##############################################################
+
+RUN_LOG_COLUMNS = [
+    "event_time",
+    "run_id",
+    "phase",
+    "event",
+    "message",
+    "objects",
+    "bytes",
+    "s3bucket",
+    "s3path",
+    "s3diskname",
+    "clustername",
+    "dryrun",
+    "chhost",
+    "hostname",
+]
+
+run_log_enabled = False
+run_id = ""
+
+
+def resolve_run_id():
+    """A stable identifier for every row this process writes."""
+    if args.runid:
+        return args.runid
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"{stamp}-{uuid.uuid4().hex[:8]}"
+
+
+def init_run_log():
+    """Create the run-log table. Degrade to stdout-only rather than failing."""
+    global run_log_enabled, run_id
+    if not args.runlog_flag:
+        logger.debug("run log disabled by --runlog false")
+        return
+
+    run_id = resolve_run_id()
+    try:
+        ch_writer.command(
+            f"""CREATE TABLE IF NOT EXISTS {log_tname} (
+            event_time DateTime64(3),
+            run_id String,
+            phase LowCardinality(String),
+            event LowCardinality(String),
+            message String,
+            objects UInt64,
+            bytes UInt64,
+            s3bucket String,
+            s3path String,
+            s3diskname LowCardinality(String),
+            clustername String,
+            dryrun Bool,
+            chhost String,
+            hostname String
+            ) ENGINE = MergeTree ORDER BY (run_id, event_time)"""
+        )
+    except Exception as exc:
+        # Most likely a missing CREATE TABLE grant. The cleanup itself is
+        # unaffected, so say so once and carry on without the durable record.
+        logger.warning(
+            f"run log unavailable, continuing with stdout only: {exc}. "
+            f"Grant CREATE TABLE on {log_tname} to record durable run history, "
+            "or pass --runlog false to silence this."
+        )
+        return
+
+    run_log_enabled = True
+    logger.info(f"run log: {log_tname}, run_id={run_id}")
+
+
+def run_log(event, message="", objects=0, bytes_=0, phase="run"):
+    """Append one durable event row. Never raises, never fails the run."""
+    global run_log_enabled
+    if not run_log_enabled:
+        return
+    try:
+        ch_writer.insert(
+            log_tname,
+            [[
+                datetime.datetime.now(datetime.timezone.utc),
+                run_id,
+                phase,
+                event,
+                LogFormatter._filter(str(message)),
+                int(objects),
+                int(bytes_),
+                args.s3bucket,
+                args.s3path,
+                args.s3diskname,
+                args.clustername,
+                bool(args.dryrun_flag),
+                args.chhost,
+                socket.gethostname(),
+            ]],
+            column_names=RUN_LOG_COLUMNS,
+        )
+    except Exception as exc:
+        # Disable rather than retry: a per-batch failure would otherwise repeat
+        # for every batch of a multi-hour delete.
+        run_log_enabled = False
+        logger.warning(f"run log write failed, disabling run log for this run: {exc}")
+
+
+def current_phase():
+    """The phase name an operator would recognise from the Job that is running."""
+    if args.collectonly_flag:
+        return "collect"
+    if args.dryrun_flag:
+        return "dry-run"
+    if args.usecollected_flag:
+        return "delete"
+    return "collect+use"
 
 
 def _query_single_value(query):
@@ -924,6 +1096,11 @@ def do_collect():
     rest_row_nums = args.total  # None if not set
     num_inserted = 0
     total_size = 0
+    # Progress is throttled rather than per-batch: at the default
+    # collectbatchsize=1024 a ten-million-object bucket would otherwise write
+    # ten thousand rows to say the same thing.
+    RUN_LOG_EVERY = 100_000
+    next_progress = RUN_LOG_EVERY
     while go_on:
         objs = []
         for batch_element in range(0, args.collectbatchsize):
@@ -942,6 +1119,17 @@ def do_collect():
         ch_client.insert(tname, objs, column_names=["objpath", "size", "last_modified", "active"])
         logger.debug(f"{len(objs)} rows inserted in {tname}")
         num_inserted += len(objs)
+        if num_inserted >= next_progress:
+            # The collect phase is otherwise silent at INFO for hours.
+            logger.info(f"collect progress: {num_inserted} objects, {total_size} bytes")
+            run_log(
+                "progress",
+                f"{num_inserted} objects listed",
+                objects=num_inserted,
+                bytes_=total_size,
+                phase="collect",
+            )
+            next_progress += RUN_LOG_EVERY
         if rest_row_nums is not None:
             rest_row_nums -= len(objs)
             if rest_row_nums == 0 or go_on == False:
@@ -954,6 +1142,13 @@ def do_collect():
                 break
     logger.info(
         f"information about {num_inserted} objects of total size {total_size} is inserted in {tname}"
+    )
+    run_log(
+        "finish",
+        f"collected {num_inserted} objects into {tname}",
+        objects=num_inserted,
+        bytes_=total_size,
+        phase="collect",
     )
 
 
@@ -982,6 +1177,11 @@ def check_samples_match_partitioning():
             f"--samples {args.samples} does not match the auxiliary table's "
             f"partitioning ({partition_key}). Partition pruning will be lost; "
             "use the same --samples value that the collect phase used."
+        )
+        run_log(
+            "warning",
+            f"--samples {args.samples} does not match partitioning {partition_key}",
+            phase="use",
         )
 
 
@@ -1051,6 +1251,7 @@ def do_use():
         num_rows, total_size = result.result_rows[0]
         if num_rows == 0:
             logger.info("Nothing to do")
+            run_log("finish", "nothing to do", phase="use")
             graceful_exit()
 
         while True:
@@ -1071,6 +1272,13 @@ def do_use():
     for sample in range(0, args.samples):
         antijoin = make_antijoin(sample=sample)
         logger.info(f"antijoin {antijoin}")
+        run_log(
+            "progress",
+            f"sample {sample} of {args.samples} started",
+            objects=num_removed,
+            bytes_=total_size,
+            phase="use",
+        )
 
         with ch_client.query_row_block_stream(antijoin) as stream:
             for block in stream:
@@ -1131,8 +1339,24 @@ def do_use():
                         logger.info(
                             f"delete checkpoint: {num_removed} objects / {total_size} bytes removed so far"
                         )
+                        # The durable twin of the checkpoint above: if the pod is
+                        # gone, this row is what says how far the delete got.
+                        run_log(
+                            "checkpoint",
+                            f"sample {sample}: {len(successful_rows)} objects deleted in this batch",
+                            objects=num_removed,
+                            bytes_=total_size,
+                            phase="use",
+                        )
 
                     if errors:
+                        run_log(
+                            "error",
+                            f"{len(errors)} S3 deletion error(s) in sample {sample}",
+                            objects=num_removed,
+                            bytes_=total_size,
+                            phase="use",
+                        )
                         raise S3DeletionError(
                             f"{len(errors)} S3 deletion error(s); successful deletes were checkpointed"
                         )
@@ -1145,6 +1369,14 @@ def do_use():
         f"{'are removed' if not args.dryrun_flag else 'would be removed but for dryrun flag'} "
         "in this attempt"
     )
+    run_log(
+        "finish",
+        f"{num_removed} objects "
+        f"{'removed' if not args.dryrun_flag else 'would be removed (dry run)'} in this attempt",
+        objects=num_removed,
+        bytes_=total_size,
+        phase="use",
+    )
     if not args.dryrun_flag:
         try:
             cumulative = ch_client.query(
@@ -1153,6 +1385,13 @@ def do_use():
             logger.info(
                 f"cumulative for this auxiliary table: {cumulative[0]} objects / "
                 f"{cumulative[1]} bytes tombstoned"
+            )
+            run_log(
+                "progress",
+                "cumulative tombstones for this auxiliary table",
+                objects=cumulative[0] or 0,
+                bytes_=cumulative[1] or 0,
+                phase="use",
             )
         except Exception as exc:  # never fail a completed run over a status query
             logger.info(f"could not read cumulative tombstone count: {exc}")
@@ -1165,6 +1404,8 @@ def do_use():
 def main():
     try:
         connect_to_ch()
+        init_run_log()
+        run_log("start", f"{current_phase()} phase started")
         if not (args.usecollected_flag and args.dryrun_flag):
             connect_to_s3()
         if not args.usecollected_flag:
@@ -1172,13 +1413,21 @@ def main():
         if not args.collectonly_flag:
             do_use()
 
+        run_log("finish", f"{current_phase()} phase completed")
         graceful_exit()
     except UserVisibleError as exc:
+        run_log("error", str(exc))
         if args.debug_flag:
             logger.exception(str(exc))
         else:
             logger.error(str(exc))
         sys.exit(1)
+    except Exception as exc:
+        # A crash is exactly the case where the pod log is least likely to
+        # survive, so record it and then let it propagate unchanged. SystemExit
+        # is not an Exception, so graceful_exit() does not land here.
+        run_log("error", f"{type(exc).__name__}: {exc}")
+        raise
 
 
 if __name__ == "__main__":

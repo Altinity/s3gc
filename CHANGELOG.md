@@ -17,6 +17,54 @@ expose.
 
 ### Added
 
+- **A durable run log in ClickHouse**, `<COLLECTTABLEPREFIX><disk>_log`, written
+  beside the auxiliary table and **never truncated**.
+
+  Why: pod logs are not a record. The kubelet rotates container output (10Mi
+  over 5 files by default), so `kubectl logs` cannot return the beginning of a
+  long run, and `ttlSecondsAfterFinished` deletes the Job and its pods along
+  with everything they printed. A cleanup that reclaimed terabytes left no
+  evidence of what it did once that window closed — the reported symptom was
+  simply "the job does not have all the log output".
+
+  ClickHouse is the sink rather than a volume or the bucket: the connection,
+  credentials and grants already exist, a `readOnlyRootFilesystem` container
+  cannot write a file, and an object written under `S3PATH` would be listed by
+  the *next* collect, found absent from `system.remote_data_paths`, and become
+  a deletion candidate — s3gc would garbage-collect its own logs.
+
+  Rows are self-describing evidence, not just text: `run_id`, `phase`, `event`,
+  `message`, running `objects`/`bytes`, and the scope the run was pointed at
+  (bucket, prefix, disk, cluster, dry-run, ClickHouse host, container
+  hostname). Events are phase start, throttled collect progress, per-sample
+  start, **per-delete-batch checkpoint**, finish with attempt totals, warnings
+  and errors. `S3GC_RUNID` defaults to a generated timestamped id and the Job
+  template passes `JOB_NAME`, so a row traces back to the Job that wrote it.
+
+  Three constraints, each with a test, because this is bookkeeping attached to
+  an irreversible operation:
+
+  1. **Writes go on `ch_writer`, never `ch_client`.** `do_use()` holds
+     `ch_client`'s session for the whole anti-join stream, and a second query on
+     a held session is `SESSION_IS_LOCKED` (373) — the 0.6.0 defect, which
+     would now fire mid-delete at the worst possible moment.
+  2. **A logging failure never fails the run.** One failure disables the run log
+     for the remainder of the process rather than retrying every batch, and a
+     missing `CREATE TABLE` grant degrades to stdout only with one warning.
+  3. **Messages are redacted** through the existing `LogFormatter._filter`
+     before insert, so a credential cannot reach a table that outlives the run.
+
+  Opt out with `--runlog false` / `S3GC_RUNLOG_FLAG=false`, or `RUNLOG=false`
+  in the renderer. Default on: durability is the point.
+
+- **Collect now reports progress at INFO**, throttled to every 100 000 objects.
+  Per-batch progress was logged at DEBUG only, so a multi-hour collect over
+  millions of objects emitted about four lines at `--verbose` — while `--debug`
+  emits one line *per object*, which on a large bucket exceeds the kubelet's
+  rotation limit and destroys the beginning of its own output. The operator's
+  real choice was "almost nothing" or "too much to retrieve".
+
+
 - **Regression tests pinning the deletion scope itself.** The suite already
   proved that a candidate list is deleted, batched and checkpointed correctly,
   but nothing proved the list contained only orphans: the ClickHouse fake

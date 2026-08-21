@@ -96,3 +96,9 @@ spec:
               value: "${ACTIVE_DEADLINE_SECONDS}"
             - name: S3GC_VERBOSE_FLAG
               value: "${VERBOSE}"
+            - name: S3GC_RUNLOG_FLAG
+              value: "${RUNLOG}"
+            # The Job name is the run id, so a run-log row traces back to the
+            # Job that wrote it after the pod and its logs are gone.
+            - name: S3GC_RUNID
+              value: "${JOB_NAME}"

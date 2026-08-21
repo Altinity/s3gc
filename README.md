@@ -283,6 +283,31 @@ are in [deploy/kubernetes/README.md](deploy/kubernetes/README.md). A guarded
 collect, dry-run, and delete in one Job and still requires an explicit delete
 confirmation.
 
+## Durable run history
+
+Each run appends structured events to `<collecttableprefix><disk>_log` in
+ClickHouse, beside the auxiliary table: phase start, collect progress,
+per-sample start, one row per confirmed delete batch, and a closing total, each
+carrying the scope the run was pointed at. The table is never truncated.
+
+This exists because pod logs are ephemeral — the kubelet rotates them and a
+deleted Job takes them with it — so a completed cleanup would otherwise leave no
+evidence of what it removed. ClickHouse is the sink because the connection and
+grants already exist; writing the log into the bucket would make the *next*
+collect see it as an orphan and delete it.
+
+```sql
+SELECT event_time, phase, event, objects, bytes, message
+FROM   <collecttableprefix><disk>_log
+WHERE  run_id = '<run-id>'
+ORDER BY event_time;
+```
+
+`--runid` labels the run (Kubernetes Jobs use the Job name automatically);
+`--runlog false` turns the table off. It needs the same `CREATE TABLE` grant as
+the auxiliary table, and a missing grant degrades to stdout only rather than
+failing the run.
+
 ## Testing
 
 Run all isolated unit tests:

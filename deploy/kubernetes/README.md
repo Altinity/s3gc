@@ -56,7 +56,7 @@ Create or provision a dedicated ClickHouse user for `s3gc`, then grant it:
 
 ```sql
 GRANT SELECT ON system.*                        TO s3gc;  -- remote_data_paths, one, disks, tables
-GRANT SELECT, INSERT, CREATE TABLE ON <db>.*    TO s3gc;  -- the auxiliary table
+GRANT SELECT, INSERT, CREATE TABLE ON <db>.*    TO s3gc;  -- auxiliary + run-log tables
 ```
 
 ### Values that vary per cluster, and bite when wrong
@@ -135,6 +135,49 @@ starts with a fresh auxiliary table and requires
 Any failed stage stops the Job and later stages do not run; successful delete
 batches remain checkpointed. Do not use this phase for customer or production
 work because it removes the manual dry-run approval gate.
+
+## Durable run history
+
+Pod logs are **not** a record. The kubelet rotates container output, so
+`kubectl logs` cannot return the start of a long run, and
+`ttlSecondsAfterFinished` deletes the Job and its pods along with everything
+they printed. `kubectl logs -f` is for watching, not for evidence.
+
+So each run also appends to `<COLLECTTABLEPREFIX><S3DISKNAME>_log` in
+ClickHouse, beside the auxiliary table. That table is **never truncated**, and
+`S3GC_RUNID` is set to the Job name, so a row traces back to the Job that wrote
+it long after the pod is gone.
+
+What a delete actually did, on the same replica-pinned `CHHOST`:
+
+```sql
+SELECT event_time, phase, event, objects, bytes, message
+FROM   <db>.<prefix><disk>_log
+WHERE  run_id = '<job-name>'
+ORDER BY event_time;
+```
+
+How far a *failed* delete got before it died, which is what tells you whether to
+start a replacement delete Job:
+
+```sql
+SELECT max(objects) AS deleted, max(bytes) AS reclaimed
+FROM   <db>.<prefix><disk>_log
+WHERE  run_id = '<job-name>' AND event = 'checkpoint';
+```
+
+Every phase of a cleanup, newest first:
+
+```sql
+SELECT run_id, min(event_time) AS started, max(event_time) AS ended,
+       anyIf(message, event = 'error') AS error
+FROM   <db>.<prefix><disk>_log
+GROUP BY run_id ORDER BY started DESC;
+```
+
+Set `RUNLOG=false` to opt out. A missing `CREATE TABLE` grant degrades to
+stdout only with one warning rather than failing the run, and a run-log write
+that fails mid-delete disables the log instead of stopping the deletion.
 
 ## Safety
 

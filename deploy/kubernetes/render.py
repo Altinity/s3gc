@@ -45,7 +45,9 @@ DELETE_CONFIRMATION = "DELETE_ORPHANS"
 # Optional keys and their defaults. An empty value renders no environment
 # variable at all, because s3gc parses S3GC_USETOTAL as an integer and would
 # reject an empty string.
-OPTIONAL = {"USETOTAL": ""}
+# RUNLOG defaults on: the durable run-log table is the only record that
+# outlives the Job, whose pod and logs ttlSecondsAfterFinished deletes.
+OPTIONAL = {"USETOTAL": "", "RUNLOG": "true"}
 # Environment variables dropped from the manifest when they render empty.
 OPTIONAL_ENV = ("S3GC_USETOTAL",)
 JOB_NAME_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
@@ -98,6 +100,8 @@ def validate(values: dict[str, str]) -> None:
         raise ValueError("VERBOSE must be true or false")
     if values["ORDER_BY_OBJPATH"] not in {"true", "false"}:
         raise ValueError("ORDER_BY_OBJPATH must be true or false")
+    if values["RUNLOG"] not in {"true", "false"}:
+        raise ValueError("RUNLOG must be true or false")
     if values["USETOTAL"] and (
         not values["USETOTAL"].isdigit() or int(values["USETOTAL"]) < 1
     ):

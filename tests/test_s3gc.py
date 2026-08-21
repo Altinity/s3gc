@@ -82,8 +82,14 @@ def args_factory():
             "interactive_flag": False,
             "use_remove_objects": True,
             "s3bucket": "bucket",
+            "s3path": "data/",
+            "chhost": "replica-0",
             "keepdata_flag": True,
             "silent_flag": True,
+            # Durable run log. run_log_enabled starts False at module level, so
+            # tests that do not opt in are unaffected by these.
+            "runlog_flag": True,
+            "runid": "test-run",
             # S3 auth surface (static | aws | iam)
             "s3auth": "static",
             "s3profile": "",
@@ -1134,3 +1140,355 @@ def test_useafter_is_quoted_as_a_string_literal(
     sql = _antijoin_sql(s3gc_module, args_factory, monkeypatch, useafter="some/object")
 
     assert "s3o.objpath > 'some/object'" in sql
+
+
+# ---------------------------------------------------------------------------
+# Durable run log.
+#
+# Pod logs are not a record: the kubelet rotates container output and
+# ttlSecondsAfterFinished deletes the Job with everything it printed. The same
+# events are therefore appended to a ClickHouse table that outlives the pod.
+#
+# This is bookkeeping attached to an irreversible operation, so the tests below
+# are mostly about what it must NOT do: never fail a run, never share the
+# streaming session, never carry a credential into a table.
+# ---------------------------------------------------------------------------
+
+
+class RecordingCH(FakeCH):
+    """A client that records DDL and TRUNCATE instead of rejecting them."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.commands = []
+
+    def command(self, query):
+        self.commands.append(query)
+        if "COUNT(1)" in query:
+            return 1
+        return None
+
+
+def _enable_run_log(s3gc_module, monkeypatch, writer, **arg_overrides):
+    """Turn the run log on the way init_run_log() would, without a server."""
+    namespace = s3gc_module["run_log"].__globals__
+    monkeypatch.setitem(namespace, "ch_writer", writer)
+    monkeypatch.setitem(namespace, "run_log_enabled", True)
+    monkeypatch.setitem(namespace, "run_id", "test-run")
+    return namespace
+
+
+def test_run_log_table_is_created_beside_the_auxiliary_table(
+    s3gc_module, args_factory, monkeypatch
+):
+    """One COLLECTTABLEPREFIX still identifies one cleanup."""
+    namespace = s3gc_module["init_run_log"].__globals__
+    writer = RecordingCH()
+    monkeypatch.setitem(namespace, "args", args_factory())
+    monkeypatch.setitem(namespace, "ch_writer", writer)
+    monkeypatch.setitem(namespace, "log_tname", "`s3objects_for_s3_log`")
+
+    s3gc_module["init_run_log"]()
+
+    ddl = " ".join(writer.commands[0].split())
+    assert "CREATE TABLE IF NOT EXISTS `s3objects_for_s3_log`" in ddl
+    assert "ENGINE = MergeTree ORDER BY (run_id, event_time)" in ddl
+    assert namespace["run_log_enabled"] is True
+
+
+def test_run_log_uses_the_configured_run_id(s3gc_module, args_factory, monkeypatch):
+    """The Kubernetes template passes JOB_NAME, so a row traces to its Job."""
+    namespace = s3gc_module["init_run_log"].__globals__
+    monkeypatch.setitem(namespace, "args", args_factory(runid="s3gc-delete-42"))
+    monkeypatch.setitem(namespace, "ch_writer", RecordingCH())
+    monkeypatch.setitem(namespace, "log_tname", "`aux_log`")
+
+    s3gc_module["init_run_log"]()
+
+    assert namespace["run_id"] == "s3gc-delete-42"
+
+
+def test_missing_create_grant_degrades_to_stdout_only(
+    s3gc_module, args_factory, monkeypatch, caplog
+):
+    """A cleanup must not fail because it could not create its own log table."""
+    namespace = s3gc_module["init_run_log"].__globals__
+
+    class NoGrantCH:
+        def command(self, query):
+            raise RuntimeError("Not enough privileges")
+
+    monkeypatch.setitem(namespace, "args", args_factory())
+    monkeypatch.setitem(namespace, "ch_writer", NoGrantCH())
+    monkeypatch.setitem(namespace, "log_tname", "`aux_log`")
+
+    with caplog.at_level("WARNING"):
+        s3gc_module["init_run_log"]()
+
+    assert namespace["run_log_enabled"] is False
+    assert "run log unavailable" in caplog.text
+
+
+def test_run_log_disabled_creates_no_table(s3gc_module, args_factory, monkeypatch):
+    """--runlog false must not touch the cluster at all."""
+    namespace = s3gc_module["init_run_log"].__globals__
+    writer = RecordingCH()
+    monkeypatch.setitem(namespace, "args", args_factory(runlog_flag=False))
+    monkeypatch.setitem(namespace, "ch_writer", writer)
+
+    s3gc_module["init_run_log"]()
+
+    assert writer.commands == []
+    assert namespace["run_log_enabled"] is False
+
+
+def test_a_failed_run_log_write_never_fails_the_run(
+    s3gc_module, args_factory, monkeypatch, caplog
+):
+    """The audit trail must not be able to kill a delete that is mid-flight."""
+    attempts = []
+
+    class BrokenWriter:
+        def insert(self, *a, **k):
+            attempts.append(1)
+            raise RuntimeError("table went away")
+
+    namespace = _enable_run_log(s3gc_module, monkeypatch, BrokenWriter())
+    monkeypatch.setitem(namespace, "args", args_factory())
+    monkeypatch.setitem(namespace, "log_tname", "`aux_log`")
+
+    with caplog.at_level("WARNING"):
+        s3gc_module["run_log"]("checkpoint", "batch done")
+        s3gc_module["run_log"]("checkpoint", "another batch")
+
+    # Disabled after the first failure, not retried once per batch for hours.
+    assert attempts == [1]
+    assert namespace["run_log_enabled"] is False
+    assert "disabling run log" in caplog.text
+
+
+def test_run_log_redacts_secrets(s3gc_module, args_factory, monkeypatch):
+    """A credential must not reach a table that outlives the run."""
+    writer = RecordingCH()
+    namespace = _enable_run_log(s3gc_module, monkeypatch, writer)
+    monkeypatch.setitem(namespace, "args", args_factory())
+    monkeypatch.setitem(namespace, "log_tname", "`aux_log`")
+    monkeypatch.setattr(
+        s3gc_module["LogFormatter"], "filter_strings", ["super-secret-key"]
+    )
+
+    s3gc_module["run_log"]("error", "failed with key super-secret-key in it")
+
+    message = writer.inserts[0][1][0][4]
+    assert "super-secret-key" not in message
+    assert "****" in message
+
+
+def test_run_log_writes_off_the_streaming_session(
+    s3gc_module, args_factory, monkeypatch
+):
+    """Same rule as tombstones: never ch_client while the anti-join streams.
+
+    A run-log insert on the streaming client is a second query on a held
+    session, which ClickHouse rejects with SESSION_IS_LOCKED (373) — and it
+    would do so mid-delete, the worst possible moment.
+    """
+    namespace = s3gc_module["do_use"].__globals__
+    streaming = StreamingCH(blocks=[[("orphan-a", 10, "time")]])
+    writer = RecordingCH()
+
+    class SuccessfulMinio:
+        def remove_objects(self, bucket, objects):
+            return iter(())
+
+    monkeypatch.setitem(namespace, "args", args_factory())
+    monkeypatch.setitem(namespace, "ch_client", streaming)
+    monkeypatch.setitem(namespace, "ch_writer", writer)
+    monkeypatch.setitem(namespace, "minio_client", SuccessfulMinio())
+    monkeypatch.setitem(namespace, "run_log_enabled", True)
+    monkeypatch.setitem(namespace, "run_id", "test-run")
+    monkeypatch.setitem(namespace, "log_tname", "`s3objects_for_s3_log`")
+
+    s3gc_module["do_use"]()
+
+    assert streaming.inserts == []
+    tables = [insert[0] for insert in writer.inserts]
+    assert "`s3objects_for_s3`" in tables          # tombstone
+    assert "`s3objects_for_s3_log`" in tables      # run-log rows
+
+
+def test_delete_batches_are_recorded_durably(s3gc_module, args_factory, monkeypatch):
+    """If the pod is gone, these rows are what say how far the delete got."""
+    namespace = s3gc_module["do_use"].__globals__
+    client = RecordingCH(blocks=[[("orphan-a", 10, "time"), ("orphan-b", 20, "time")]])
+
+    class SuccessfulMinio:
+        def remove_objects(self, bucket, objects):
+            return iter(())
+
+    monkeypatch.setitem(namespace, "args", args_factory(deletebatchsize=1))
+    monkeypatch.setitem(namespace, "ch_client", client)
+    monkeypatch.setitem(namespace, "ch_writer", client)
+    monkeypatch.setitem(namespace, "minio_client", SuccessfulMinio())
+    monkeypatch.setitem(namespace, "run_log_enabled", True)
+    monkeypatch.setitem(namespace, "run_id", "test-run")
+    monkeypatch.setitem(namespace, "log_tname", "`aux_log`")
+
+    s3gc_module["do_use"]()
+
+    events = [
+        (row[3], row[5], row[6])
+        for table, rows, _ in client.inserts
+        if table == "`aux_log`"
+        for row in rows
+    ]
+    checkpoints = [event for event in events if event[0] == "checkpoint"]
+    assert len(checkpoints) == 2
+    # Running totals, so a truncated log still shows how far it got.
+    assert checkpoints[0][1] == 1 and checkpoints[1][1] == 2
+    assert checkpoints[-1][2] == 30
+    assert any(event[0] == "finish" for event in events)
+
+
+def test_run_log_table_is_never_truncated(s3gc_module, args_factory, monkeypatch):
+    """The aux table is scratch space; the run log is the record. Only one is wiped."""
+    namespace = s3gc_module["do_use"].__globals__
+    client = RecordingCH(blocks=[])
+
+    monkeypatch.setitem(
+        namespace, "args", args_factory(keepdata_flag=False, dryrun_flag=False)
+    )
+    monkeypatch.setitem(namespace, "ch_client", client)
+    monkeypatch.setitem(namespace, "ch_writer", client)
+    monkeypatch.setitem(namespace, "run_log_enabled", True)
+    monkeypatch.setitem(namespace, "run_id", "test-run")
+    monkeypatch.setitem(namespace, "log_tname", "`aux_log`")
+
+    s3gc_module["do_use"]()
+
+    truncates = [query for query in client.commands if "TRUNCATE" in query]
+    assert truncates == ["TRUNCATE TABLE `s3objects_for_s3`"]
+    assert not any("aux_log" in query for query in truncates)
+
+
+def test_run_log_records_the_scope_of_the_run(s3gc_module, args_factory, monkeypatch):
+    """Every row is self-describing evidence, not just a message."""
+    writer = RecordingCH()
+    namespace = _enable_run_log(s3gc_module, monkeypatch, writer)
+    monkeypatch.setitem(
+        namespace,
+        "args",
+        args_factory(s3bucket="the-bucket", s3path="pre/fix/", s3diskname="gcs",
+                     clustername="prod", dryrun_flag=True, chhost="replica-0"),
+    )
+    monkeypatch.setitem(namespace, "log_tname", "`aux_log`")
+
+    s3gc_module["run_log"]("start", "dry-run phase started", phase="run")
+
+    row = dict(zip(s3gc_module["RUN_LOG_COLUMNS"], writer.inserts[0][1][0]))
+    assert row["run_id"] == "test-run"
+    assert row["phase"] == "run" and row["event"] == "start"
+    assert row["s3bucket"] == "the-bucket" and row["s3path"] == "pre/fix/"
+    assert row["s3diskname"] == "gcs" and row["clustername"] == "prod"
+    assert row["dryrun"] is True and row["chhost"] == "replica-0"
+
+
+def test_collect_reports_progress_for_long_runs(
+    s3gc_module, args_factory, monkeypatch, caplog
+):
+    """A multi-hour collect used to emit nothing at INFO until it finished."""
+    import datetime
+
+    namespace = s3gc_module["do_collect"].__globals__
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    class Obj:
+        def __init__(self, name):
+            self.object_name = name
+            self.size = 1
+            self.last_modified = now - datetime.timedelta(days=2)
+
+    class Minio:
+        def list_objects(self, bucket, prefix, recursive, start_after):
+            return iter(Obj(f"object-{index}") for index in range(200_000))
+
+    writer = RecordingCH()
+    monkeypatch.setitem(
+        namespace,
+        "args",
+        args_factory(age=0, collectbatchsize=50_000, total=None, collectafter="",
+                     s3path="", createdatabase_flag=False,
+                     drop_collecttable_flag=False, samples=4),
+    )
+    monkeypatch.setitem(namespace, "minio_client", Minio())
+    monkeypatch.setitem(namespace, "ch_client", RecordingCH())
+    monkeypatch.setitem(namespace, "ch_writer", writer)
+    monkeypatch.setitem(namespace, "tname", "`aux`")
+    monkeypatch.setitem(namespace, "log_tname", "`aux_log`")
+    monkeypatch.setitem(namespace, "run_log_enabled", True)
+    monkeypatch.setitem(namespace, "run_id", "test-run")
+
+    with caplog.at_level("INFO", logger="s3gc_test"):
+        s3gc_module["do_collect"]()
+
+    assert "collect progress" in caplog.text
+    events = [
+        row[3] for table, rows, _ in writer.inserts if table == "`aux_log`" for row in rows
+    ]
+    assert events.count("progress") == 2      # throttled to every 100k
+    assert events[-1] == "finish"
+
+
+@pytest.mark.parametrize(
+    ("replacement", "message"),
+    [
+        (("RUNLOG=true", "RUNLOG=maybe"), "RUNLOG must be true or false"),
+        (("RUNLOG=true", "RUNLOG="), "RUNLOG must be true or false"),
+    ],
+)
+def test_renderer_validates_runlog(tmp_path, replacement, message):
+    source = (ROOT / "deploy/kubernetes/example.env").read_text()
+    config_path = tmp_path / "runlog.env"
+    config_path.write_text(source.replace(*replacement))
+
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "deploy/kubernetes/render.py"), config_path],
+        capture_output=True, text=True, check=False,
+    )
+
+    assert result.returncode == 64
+    assert message in result.stderr
+
+
+def test_renderer_defaults_runlog_on_for_legacy_env_files(tmp_path):
+    """Pre-existing env files must keep rendering, with the run log enabled."""
+    source = (ROOT / "deploy/kubernetes/example.env").read_text()
+    without = "\n".join(
+        line for line in source.splitlines() if not line.startswith("RUNLOG=")
+    )
+    config_path = tmp_path / "legacy.env"
+    config_path.write_text(without)
+
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "deploy/kubernetes/render.py"), config_path],
+        capture_output=True, text=True, check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "S3GC_RUNLOG_FLAG" in result.stdout
+    assert 'value: "true"' in result.stdout
+
+
+def test_renderer_uses_the_job_name_as_the_run_id(tmp_path):
+    """A run-log row must trace back to the Job that wrote it."""
+    config_path = tmp_path / "runid.env"
+    config_path.write_text((ROOT / "deploy/kubernetes/example.env").read_text())
+
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "deploy/kubernetes/render.py"), config_path],
+        capture_output=True, text=True, check=False,
+    )
+
+    assert result.returncode == 0
+    assert "- name: S3GC_RUNID" in result.stdout
+    assert 'value: "s3gc-example-dry-run"' in result.stdout

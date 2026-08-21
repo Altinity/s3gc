@@ -15,7 +15,52 @@ expose.
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **Regression tests pinning the deletion scope itself.** The suite already
+  proved that a candidate list is deleted, batched and checkpointed correctly,
+  but nothing proved the list contained only orphans: the ClickHouse fake
+  ignores the anti-join SQL and returns pre-canned blocks, so the one statement
+  that forms the entire safety boundary was never asserted on.
+
+  Mutation testing established the gap rather than assuming it. Against the
+  65-test suite, **nine of eleven** deliberate breakages of the delete scope
+  passed fully green — including turning `LEFT ANTI JOIN` into a plain
+  `LEFT JOIN` (every *referenced* object becomes a deletion candidate) and
+  making `--dry-run` delete for real. Only the two error-bookkeeping mutations
+  were caught.
+
+  The scope is now asserted directly: anti-join semantics, the
+  `remote_path = objpath` join key, the `disk_name` predicate, the
+  `clusterAllReplicas` fan-out when a cluster is configured, `active=true`,
+  the `--useage` window, candidates being drawn only from the auxiliary table,
+  that a dry run cannot reach S3 at all, and that the cluster/replica preflight
+  gates the delete path. All eleven mutations are now caught.
+
+  Why it is worth the words: the anti-join is correct today, so this changes no
+  behaviour. It exists so that a future edit which quietly widens the deletion
+  scope fails a test instead of reaching a customer bucket.
+
+### Known defects recorded
+
+- **`USEAGE_HOURS=0` silently removes the only protection against deleting a
+  part mid-write.** ClickHouse uploads a part's blobs to S3 and registers them
+  in `system.remote_data_paths` a moment later; in that window a live blob is
+  absent from the reference table and looks orphaned. There is no per-object
+  re-check before the S3 delete, so the `--useage` clause is the whole safety
+  margin — and `if args.useage else ""` emits no clause at all for 0, which
+  `render.py` accepts (only negatives are rejected). Documented by
+  `test_useage_zero_disables_the_age_guard`; the fix (refuse, or warn) is
+  deliberately deferred to an explicit decision and tracked in `TODO.md`.
+
+- **`--useafter` is interpolated unquoted**, so the value lands as a bare SQL
+  identifier rather than a string literal. It is the only unquoted value in the
+  anti-join `WHERE` clause. Fail-closed in practice (unknown identifier), and
+  recorded as a strict `xfail` so it flips to a failure the moment it is fixed.
+
+- **The cluster/replica preflight is a point-in-time check**, run once, while
+  the anti-join is re-issued per sample over what can be hours. A replica
+  dropping out mid-run is not re-detected.
 
 ## [0.6.0] - 2026-08-19
 

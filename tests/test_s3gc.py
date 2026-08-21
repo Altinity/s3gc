@@ -932,3 +932,205 @@ def test_renderer_wires_auth_env_into_the_job(tmp_path):
     assert 'name: S3GC_S3AUTH' in result.stdout
     assert 'value: "aws"' in result.stdout
     assert 'value: "sso"' in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Deletion-scope invariants.
+#
+# The tests above prove a candidate list is deleted, batched and checkpointed
+# correctly. They cannot prove the list contains only orphans, because
+# FakeCH.query_row_block_stream ignores the SQL and returns pre-canned blocks.
+#
+# Mutation testing confirmed the gap: turning LEFT ANTI JOIN into a plain LEFT
+# JOIN, pointing disk_name at a nonexistent disk, dropping the join key,
+# dropping the clusterAllReplicas fan-out, dropping the --useage window, and
+# even making --dry-run delete for real ALL left the suite fully green.
+#
+# These tests pin the scope itself: what may be considered for deletion, and
+# what must be excluded. They assert on the generated anti-join because that
+# single statement is the whole safety boundary.
+# ---------------------------------------------------------------------------
+
+
+def _antijoin_sql(s3gc_module, args_factory, monkeypatch, **overrides):
+    """Return the anti-join s3gc would stream, whitespace-normalised."""
+    namespace = s3gc_module["do_use"].__globals__
+    client = FakeCH()
+    overrides.setdefault("dryrun_flag", True)
+    monkeypatch.setitem(namespace, "args", args_factory(**overrides))
+    monkeypatch.setitem(namespace, "ch_client", client)
+
+    s3gc_module["do_use"]()
+
+    return " ".join(client.stream_query.split())
+
+
+def test_candidates_are_only_unreferenced_objects(s3gc_module, args_factory, monkeypatch):
+    """The join must be LEFT ANTI: keep rows with NO match in remote_data_paths.
+
+    A plain LEFT JOIN keeps matched rows too, so every referenced object becomes
+    a deletion candidate. That is the disaster case and it must not be reachable
+    by an edit that keeps the tests green.
+    """
+    sql = _antijoin_sql(s3gc_module, args_factory, monkeypatch)
+
+    assert "LEFT ANTI JOIN" in sql
+
+
+def test_candidates_come_only_from_the_collected_inventory(
+    s3gc_module, args_factory, monkeypatch
+):
+    """Deletion can only ever consider rows collected into the auxiliary table.
+
+    This is what makes objects created after the collect phase safe: they are
+    absent from the table, so the delete phase cannot see them at all.
+    """
+    sql = _antijoin_sql(s3gc_module, args_factory, monkeypatch)
+
+    assert "FROM `s3objects_for_s3` AS s3o" in sql
+
+
+def test_reference_check_matches_on_object_path(s3gc_module, args_factory, monkeypatch):
+    """Losing the join key makes nothing match, so every object looks orphaned."""
+    sql = _antijoin_sql(s3gc_module, args_factory, monkeypatch)
+
+    assert "rdp.remote_path = s3o.objpath" in sql
+
+
+@pytest.mark.parametrize("disk", ["s3", "gcs"])
+def test_reference_check_is_scoped_to_the_configured_disk(
+    s3gc_module, args_factory, monkeypatch, disk
+):
+    """A wrong disk name matches no reference at all, orphaning the whole bucket."""
+    sql = _antijoin_sql(s3gc_module, args_factory, monkeypatch, s3diskname=disk)
+
+    assert f"rdp.disk_name='{disk}'" in sql
+
+
+def test_cluster_cleanup_checks_every_replica(s3gc_module, args_factory, monkeypatch):
+    """With a cluster configured, references must be read from ALL replicas.
+
+    Reading only the local replica orphans blobs that another replica still
+    references — the zero-copy replication disaster case.
+    """
+    sql = _antijoin_sql(s3gc_module, args_factory, monkeypatch, clustername="prod")
+
+    assert "clusterAllReplicas('prod', system.remote_data_paths)" in sql
+
+
+def test_without_a_cluster_only_the_local_replica_is_consulted(
+    s3gc_module, args_factory, monkeypatch
+):
+    """Documents the narrowed scope of an unclustered run.
+
+    Deleting with no --cluster only sees one replica's references. The
+    Kubernetes entrypoint requires CLUSTERNAME for the delete phase; a direct
+    CLI run does not, so the narrowing is real and deliberate here.
+    """
+    sql = _antijoin_sql(s3gc_module, args_factory, monkeypatch, clustername="")
+
+    assert "clusterAllReplicas" not in sql
+    assert "system.remote_data_paths AS rdp" in sql
+
+
+def test_tombstoned_objects_are_not_reconsidered(s3gc_module, args_factory, monkeypatch):
+    """active=true excludes rows already tombstoned by an earlier delete attempt."""
+    sql = _antijoin_sql(s3gc_module, args_factory, monkeypatch)
+
+    assert "s3o.active=true" in sql
+
+
+def test_age_guard_excludes_recently_written_objects(
+    s3gc_module, args_factory, monkeypatch
+):
+    """--useage is the ONLY protection against deleting a part mid-write.
+
+    ClickHouse uploads a part's blobs to S3 and registers them in
+    remote_data_paths a moment later. In that window a live blob is absent from
+    remote_data_paths and looks orphaned. There is no per-object re-check before
+    the S3 delete, so this clause is the whole safety margin.
+    """
+    sql = _antijoin_sql(s3gc_module, args_factory, monkeypatch, useage=24)
+
+    assert "s3o.last_modified < now() - interval 24 hour" in sql
+
+
+def test_useage_zero_disables_the_age_guard(s3gc_module, args_factory, monkeypatch):
+    """Documents a HAZARD, not a desired behaviour.
+
+    `if args.useage else ""` means useage=0 emits no age clause, and
+    render.py accepts USEAGE_HOURS=0 (only negatives are rejected). A run
+    configured that way has no protection against the mid-write window above.
+    If s3gc is later changed to refuse or warn on 0, this test should fail and
+    be updated deliberately.
+    """
+    sql = _antijoin_sql(s3gc_module, args_factory, monkeypatch, useage=0)
+
+    assert "interval" not in sql
+
+
+def test_dry_run_performs_no_s3_operations(s3gc_module, args_factory, monkeypatch):
+    """A dry run must be incapable of touching S3, even with candidates present."""
+    namespace = s3gc_module["do_use"].__globals__
+
+    class ExplodingMinio:
+        def __getattr__(self, name):
+            raise AssertionError(f"dry run must not call S3: {name}")
+
+    client = FakeCH(blocks=[[("orphan-a", 10, "time"), ("orphan-b", 20, "time")]])
+    monkeypatch.setitem(namespace, "args", args_factory(dryrun_flag=True))
+    monkeypatch.setitem(namespace, "ch_client", client)
+    monkeypatch.setitem(namespace, "minio_client", ExplodingMinio())
+
+    s3gc_module["do_use"]()
+
+    assert client.inserts == []
+
+
+def test_delete_runs_preflight_before_touching_s3(
+    s3gc_module, args_factory, monkeypatch
+):
+    """The cluster/replica preflight must gate the delete path, not decorate it."""
+    namespace = s3gc_module["do_use"].__globals__
+
+    class ExplodingMinio:
+        def __getattr__(self, name):
+            raise AssertionError(f"preflight must run before S3: {name}")
+
+    def refuse():
+        raise RuntimeError("preflight refused")
+
+    monkeypatch.setitem(namespace, "args", args_factory(dryrun_flag=False))
+    monkeypatch.setitem(namespace, "ch_client", FakeCH(blocks=[[("orphan", 1, "time")]]))
+    monkeypatch.setitem(namespace, "minio_client", ExplodingMinio())
+    monkeypatch.setitem(namespace, "preflight_cluster", refuse)
+
+    with pytest.raises(RuntimeError, match="preflight refused"):
+        s3gc_module["do_use"]()
+
+
+def test_preflight_rejects_unexpected_replica_count(
+    s3gc_module, args_factory, monkeypatch
+):
+    """A topology that does not match must fail closed before any deletion."""
+    namespace = s3gc_module["preflight_cluster"].__globals__
+    monkeypatch.setitem(namespace, "args", args_factory(expected_replicas=2))
+    monkeypatch.setitem(namespace, "ch_client", FakeCH(cluster="cluster", replicas=3))
+
+    with pytest.raises(RuntimeError, match="replica preflight failed"):
+        s3gc_module["preflight_cluster"]()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="known defect: --useafter is interpolated unquoted, so the value "
+    "lands as a bare SQL identifier instead of a string literal "
+    "(s3gc.py, make_antijoin/after_condition). Fail-closed in practice, but "
+    "it is the only unquoted value in the WHERE clause.",
+)
+def test_useafter_is_quoted_as_a_string_literal(
+    s3gc_module, args_factory, monkeypatch
+):
+    sql = _antijoin_sql(s3gc_module, args_factory, monkeypatch, useafter="some/object")
+
+    assert "s3o.objpath > 'some/object'" in sql

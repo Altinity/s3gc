@@ -335,8 +335,12 @@ parser.add_argument(
     "--useage-hours",
     dest="useage",
     type=int,
-    default=0,
-    help="Process only already collected objects older than specified number of hours",
+    default=24,
+    help=(
+        "Process only already collected objects older than specified number of "
+        "hours. Minimum 24: below that a run can delete a part between its blob "
+        "upload and its registration in system.remote_data_paths"
+    ),
 )
 parser.add_argument(
     "--samples",
@@ -504,6 +508,17 @@ parser.add_argument(
 )
 
 parser.add_argument(
+    "--dev-allow-short-useage",
+    dest="dev_allow_short_useage",
+    type=coerce_bool,
+    default=False,
+    help=(
+        "development only: permit --useage below the 24 hour minimum. Passed only "
+        "by the dev-automation entrypoint phase, which seeds and deletes its own "
+        "fixtures within minutes. Never set this for customer or production work"
+    ),
+)
+parser.add_argument(
     "--runlog",
     "--run-log",
     dest="runlog_flag",
@@ -542,6 +557,7 @@ args = parser.parse_args()
 BOOLEAN_DESTS = (
     "s3secure_flag",
     "runlog_flag",
+    "dev_allow_short_useage",
     "use_remove_objects",
     "keepdata_flag",
     "collectonly_flag",
@@ -676,6 +692,18 @@ ch_client = None
 # A second ClickHouse client, used only for writes issued while a result
 # stream from ch_client is still open. See connect_to_ch().
 ch_writer = None
+
+
+# ClickHouse uploads a part's blobs to S3 and registers them in
+# system.remote_data_paths a moment later. In that window a live blob is absent
+# from the reference table and looks orphaned, and there is no per-object
+# re-check before the S3 delete — so the age window is the ONLY thing standing
+# between a run and live data.
+#
+# 24 hours is far longer than any part write, and short enough to stay useful.
+# It is a floor, not a default to be talked down: a run configured below it is
+# refused rather than warned about.
+MINIMUM_USEAGE_HOURS = 24
 
 
 class S3DeletionError(RuntimeError):
@@ -1186,6 +1214,33 @@ def check_samples_match_partitioning():
 
 
 def do_use():
+    if args.useage < MINIMUM_USEAGE_HOURS:
+        if not args.dev_allow_short_useage:
+            # Refused for --dry-run too, so the reviewed preview is exactly the
+            # set a delete would remove. A dry run that previews a wider set
+            # than the delete honours is worse than no preview at all.
+            raise UserVisibleError(
+                f"--useage {args.useage} is below the {MINIMUM_USEAGE_HOURS} hour minimum. "
+                "The age window is the only protection against deleting a part between "
+                "its upload to S3 and its registration in system.remote_data_paths; "
+                f"use --useage {MINIMUM_USEAGE_HOURS} or greater."
+            )
+        # Reachable only through the dev-automation phase, which seeds and
+        # deletes its own fixtures. Say so loudly and put it in the durable run
+        # log, so a run that did this can never be mistaken for a normal one.
+        logger.warning(
+            f"--useage {args.useage} is below the {MINIMUM_USEAGE_HOURS} hour minimum and is "
+            "permitted ONLY because --dev-allow-short-useage is set. This run can "
+            "delete a part that is still being written. Never use this against "
+            "customer or production data."
+        )
+        run_log(
+            "warning",
+            f"useage {args.useage} below the {MINIMUM_USEAGE_HOURS}h minimum, "
+            "permitted by --dev-allow-short-useage",
+            phase="use",
+        )
+
     if not args.dryrun_flag:
         preflight_cluster()
 

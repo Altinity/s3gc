@@ -15,6 +15,44 @@ expose.
 
 ## [Unreleased]
 
+### Changed
+
+- **`--useage` now has a hard floor of 24 hours, and defaults to 24** instead
+  of 0. Below the floor a run is refused outright rather than warned about, for
+  `--dry-run` as well as delete.
+
+  Why a floor and not a warning: the age window is the *only* thing standing
+  between a run and live data. ClickHouse uploads a part's blobs to S3 and
+  registers them in `system.remote_data_paths` a moment later; in that window a
+  live blob is absent from the reference table and looks orphaned, and there is
+  no per-object re-check before the S3 delete. `--useage 0` silently removed
+  that protection, the default *was* 0, and `render.py` accepted it — so the
+  dangerous configuration was also the out-of-the-box one for anyone who did
+  not set it.
+
+  Why a floor and not a hardcoded constant: the parameter is only dangerous
+  downward. Upward it is the "be more careful" lever — a cluster with slow
+  merges or long-running mutations may legitimately want 72 hours or a week.
+  Removing it would forfeit that and buy nothing the floor does not already
+  give.
+
+  Refused for `--dry-run` too, deliberately: a preview computed over a wider
+  set than the delete would honour is worse than no preview, because the
+  reviewed number is the one the customer approves.
+
+  The floor is enforced in **both** `s3gc.py` and `render.py`. The renderer
+  catches it before a Job is applied; the tool catches a direct CLI run, which
+  never passes through the renderer at all.
+
+  **Development escape hatch, scoped to the one non-production phase.**
+  `PHASE=dev-automation` seeds and deletes its own fixtures within minutes, so
+  a 24 hour window would make it find nothing and "succeed" vacuously — worse
+  than failing. That phase, and only that phase, passes
+  `--dev-allow-short-useage`; the `collect`, `dry-run` and `delete` branches of
+  the entrypoint never do, and a test asserts it. A run that uses it logs a
+  warning and writes a `warning` row to the durable run log, so it can never be
+  mistaken for a normal one.
+
 ### Added
 
 - **A durable run log in ClickHouse**, `<COLLECTTABLEPREFIX><disk>_log`, written

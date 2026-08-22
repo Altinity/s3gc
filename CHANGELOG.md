@@ -15,6 +15,27 @@ expose.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Cluster topology is re-checked before every sample, not once per run.** The
+  preflight was a point-in-time check while the anti-join loop can run for
+  hours. A replica that dropped out mid-run took its references with it, so
+  blobs it alone held started looking orphaned — and nothing noticed. Now
+  re-verified before each sample and failed closed. `ch_client` is free at that
+  point: the previous sample's stream has closed.
+
+- **`--useafter` is quoted as a SQL string literal.** It was interpolated bare,
+  so an operator-supplied value landed as an identifier — the only unquoted
+  value in the anti-join `WHERE` clause. The strict `xfail` added when this was
+  recorded flipped to XPASS and became a real test, which is what it was for.
+
+- **The image sets `PYTHONUNBUFFERED=1`.** stdout is a pipe under Kubernetes so
+  `print()` was block-buffered, and Python's default SIGTERM handling exits
+  without flushing: a Job killed at `activeDeadlineSeconds` lost its buffered
+  tail, including the closing `s3gc: OK`, and the `dev-automation` shell echoes
+  interleaved wrongly against it. Logger records were never affected —
+  `StreamHandler.emit()` flushes per record.
+
 ### Changed
 
 - **`--useage` now has a hard floor of 24 hours, and defaults to 24** instead

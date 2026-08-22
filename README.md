@@ -104,7 +104,7 @@ export S3GC_CLUSTERNAME='<clickhouse-cluster>'
 export S3GC_EXPECTED_REPLICAS=2
 export S3GC_COLLECTTABLEPREFIX='s3gc_example_'
 export S3GC_AGE=24
-export S3GC_USEAGE=24
+export S3GC_USEAGE=24   # minimum 24; raising is fine, lowering is refused
 ```
 
 ### S3 authentication modes

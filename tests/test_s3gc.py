@@ -1206,13 +1206,6 @@ def test_preflight_rejects_unexpected_replica_count(
         s3gc_module["preflight_cluster"]()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="known defect: --useafter is interpolated unquoted, so the value "
-    "lands as a bare SQL identifier instead of a string literal "
-    "(s3gc.py, make_antijoin/after_condition). Fail-closed in practice, but "
-    "it is the only unquoted value in the WHERE clause.",
-)
 def test_useafter_is_quoted_as_a_string_literal(
     s3gc_module, args_factory, monkeypatch
 ):
@@ -1639,3 +1632,83 @@ def test_only_dev_automation_passes_the_short_window_flag(tmp_path):
     dev_calls = run("dev-automation")
     assert dev_calls.count("--dev-allow-short-useage=true") == 2
     assert "--dev-allow-short-useage\n" not in dev_calls
+
+
+def test_useafter_escapes_quotes(s3gc_module, args_factory, monkeypatch):
+    """An object name containing a quote must not terminate the literal."""
+    sql = _antijoin_sql(
+        s3gc_module, args_factory, monkeypatch, useafter="odd'name"
+    )
+
+    assert r"s3o.objpath > 'odd\'name'" in sql
+
+
+def test_topology_is_rechecked_for_every_sample(
+    s3gc_module, args_factory, monkeypatch
+):
+    """The preflight is point-in-time; this loop can run for hours.
+
+    A replica that drops out mid-run takes its references with it, so blobs it
+    alone holds start looking orphaned. Re-check before each sample and fail
+    closed rather than delete against a shrunken reference scope.
+    """
+    namespace = s3gc_module["do_use"].__globals__
+
+    class ShrinkingCluster(FakeCH):
+        """Loses a replica after the first sample's preflight."""
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.preflights = 0
+
+        def query(self, query):
+            if "clusterAllReplicas" in query and "system.one" in query:
+                self.preflights += 1
+                return QueryResult(2 if self.preflights == 1 else 1)
+            return super().query(query)
+
+    class SuccessfulMinio:
+        def remove_objects(self, bucket, objects):
+            return iter(())
+
+    client = ShrinkingCluster(blocks=[])
+    monkeypatch.setitem(namespace, "args", args_factory(samples=2))
+    monkeypatch.setitem(namespace, "ch_client", client)
+    monkeypatch.setitem(namespace, "ch_writer", RecordingCH())
+    monkeypatch.setitem(namespace, "minio_client", SuccessfulMinio())
+
+    with pytest.raises(RuntimeError, match="replica preflight failed"):
+        s3gc_module["do_use"]()
+
+    # Once up front, then again before sample 0 -- the earliest re-check, which
+    # is where the shrunken topology is caught. The run never reaches sample 1.
+    assert client.preflights == 2
+
+
+def test_dry_run_does_not_require_a_cluster_preflight(
+    s3gc_module, args_factory, monkeypatch
+):
+    """Reading is safe; only the destructive path needs the topology check."""
+    namespace = s3gc_module["do_use"].__globals__
+
+    def refuse():
+        raise AssertionError("dry run must not require preflight")
+
+    monkeypatch.setitem(namespace, "args", args_factory(dryrun_flag=True, samples=2))
+    monkeypatch.setitem(namespace, "ch_client", FakeCH())
+    monkeypatch.setitem(namespace, "preflight_cluster", refuse)
+
+    s3gc_module["do_use"]()
+
+
+def test_image_disables_stdout_buffering():
+    """A Job killed at activeDeadlineSeconds used to lose its buffered tail.
+
+    stdout is a pipe under Kubernetes so print() is block-buffered, and Python's
+    default SIGTERM handling exits without flushing -- taking the closing
+    "s3gc: OK" with it, and interleaving the dev-automation shell echoes wrongly
+    against the Python output.
+    """
+    dockerfile = (ROOT / "docker/Dockerfile").read_text()
+
+    assert "ENV PYTHONUNBUFFERED=1" in dockerfile

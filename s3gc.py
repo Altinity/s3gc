@@ -846,6 +846,17 @@ def current_phase():
     return "collect+use"
 
 
+def quote_sql_string(value):
+    """Render a Python string as a ClickHouse string literal.
+
+    --useafter was interpolated bare, so an operator-supplied value landed as an
+    identifier rather than a literal. Fail-closed in practice, but it was the
+    only unquoted value in the anti-join WHERE clause.
+    """
+    escaped = str(value).replace("\\", "\\\\").replace("'", "\\'")
+    return f"'{escaped}'"
+
+
 def _query_single_value(query):
     result = ch_client.query(query)
     if not result.result_rows or not result.result_rows[0]:
@@ -1272,7 +1283,9 @@ def do_use():
     check_samples_match_partitioning()
 
     def make_antijoin(calc_only=False, sample=None):
-        after_condition = f"AND s3o.objpath > {args.useafter} " if args.useafter else ""
+        after_condition = (
+            f"AND s3o.objpath > {quote_sql_string(args.useafter)} " if args.useafter else ""
+        )
         age_condition = f"AND s3o.last_modified < now() - interval {args.useage} hour " if args.useage else ""
         limit = f" LIMIT {args.usetotal} " if args.usetotal else ""
 
@@ -1325,6 +1338,14 @@ def do_use():
     if not args.dryrun_flag and args.deletebatchsize < 1:
         raise ValueError("--deletebatchsize must be a positive integer")
     for sample in range(0, args.samples):
+        # Re-checked per sample, not once per run. The preflight above is a
+        # point-in-time check while this loop can run for hours; a replica that
+        # drops out mid-run would otherwise take its references with it and make
+        # blobs it alone holds look orphaned. ch_client is free here -- the
+        # previous sample's stream has closed.
+        if not args.dryrun_flag:
+            preflight_cluster()
+
         antijoin = make_antijoin(sample=sample)
         logger.info(f"antijoin {antijoin}")
         run_log(

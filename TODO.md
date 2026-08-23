@@ -22,4 +22,3 @@ forward-looking backlog.
   either site alone is covered by the other. Removing site A and retargeting M7
   at the per-sample call restores a clean 11/11. Not a defect — removing both
   sites still fails two tests.
-

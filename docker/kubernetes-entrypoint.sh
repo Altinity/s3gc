@@ -43,9 +43,9 @@ case "${phase}" in
     echo "s3gc dev automation: collect"
     python /app/s3gc.py --collectonly --keepdata --drop-collecttable
     echo "s3gc dev automation: dry-run"
-    python /app/s3gc.py --usecollected --dry-run --dev-allow-short-useage
+    python /app/s3gc.py --usecollected --dry-run --dev-allow-short-useage=true
     echo "s3gc dev automation: delete"
-    exec python /app/s3gc.py --usecollected --keepdata --non-interactive --dev-allow-short-useage
+    exec python /app/s3gc.py --usecollected --keepdata --non-interactive --dev-allow-short-useage=true
     ;;
   *)
     echo "Invalid S3GC_PHASE=${phase}; use collect, dry-run, delete, or dev-automation" >&2

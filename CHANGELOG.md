@@ -51,7 +51,8 @@ expose.
   `--dev-allow-short-useage`; the `collect`, `dry-run` and `delete` branches of
   the entrypoint never do, and a test asserts it. A run that uses it logs a
   warning and writes a `warning` row to the durable run log, so it can never be
-  mistaken for a normal one.
+  mistaken for a normal one. The entrypoint passes the explicit
+  `--dev-allow-short-useage=true` value required by the boolean parser.
 
 ### Added
 

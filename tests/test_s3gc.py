@@ -305,8 +305,8 @@ def test_dev_automation_entrypoint_runs_collect_dry_run_and_delete(tmp_path):
     assert result.returncode == 0
     assert calls_path.read_text().splitlines() == [
         "/app/s3gc.py --collectonly --keepdata --drop-collecttable",
-        "/app/s3gc.py --usecollected --dry-run --dev-allow-short-useage",
-        "/app/s3gc.py --usecollected --keepdata --non-interactive --dev-allow-short-useage",
+        "/app/s3gc.py --usecollected --dry-run --dev-allow-short-useage=true",
+        "/app/s3gc.py --usecollected --keepdata --non-interactive --dev-allow-short-useage=true",
     ]
 
 
@@ -339,7 +339,7 @@ def test_dev_automation_entrypoint_stops_after_an_error(tmp_path):
     assert result.returncode == 42
     assert calls_path.read_text().splitlines() == [
         "/app/s3gc.py --collectonly --keepdata --drop-collecttable",
-        "/app/s3gc.py --usecollected --dry-run --dev-allow-short-useage",
+        "/app/s3gc.py --usecollected --dry-run --dev-allow-short-useage=true",
     ]
 
 
@@ -1636,4 +1636,6 @@ def test_only_dev_automation_passes_the_short_window_flag(tmp_path):
 
     for phase in ("collect", "dry-run", "delete"):
         assert "--dev-allow-short-useage" not in run(phase), phase
-    assert run("dev-automation").count("--dev-allow-short-useage") == 2
+    dev_calls = run("dev-automation")
+    assert dev_calls.count("--dev-allow-short-useage=true") == 2
+    assert "--dev-allow-short-useage\n" not in dev_calls

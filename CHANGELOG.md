@@ -15,6 +15,25 @@ expose.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.7.0] - 2026-08-24
+
+A safety release, and its headline is uncomfortable: the dangerous
+configuration was also the default one. `--useage` defaulted to 0, which emits
+no age predicate at all, and that window is the only thing standing between a
+run and a part ClickHouse has uploaded to S3 but not yet registered in
+`system.remote_data_paths`. Anyone who never set the flag was running without
+the protection. It now defaults to 24 hours and refuses anything lower, in both
+the tool and the renderer.
+
+The other half of the release is evidence. Mutation testing showed that nine of
+eleven deliberate breakages of the deletion scope passed the previous suite
+fully green — including turning the `LEFT ANTI JOIN` into a plain `LEFT JOIN`,
+and making `--dry-run` delete for real. The scope is now asserted directly, and
+a run leaves a durable record in ClickHouse that outlives the pod that wrote
+it.
+
 ### Fixed
 
 - **Cluster topology is re-checked before every sample, not once per run.** The
@@ -149,26 +168,36 @@ expose.
   behaviour. It exists so that a future edit which quietly widens the deletion
   scope fails a test instead of reaching a customer bucket.
 
-### Known defects recorded
+### How these defects were found
 
-- **`USEAGE_HOURS=0` silently removes the only protection against deleting a
-  part mid-write.** ClickHouse uploads a part's blobs to S3 and registers them
-  in `system.remote_data_paths` a moment later; in that window a live blob is
-  absent from the reference table and looks orphaned. There is no per-object
-  re-check before the S3 delete, so the `--useage` clause is the whole safety
-  margin — and `if args.useage else ""` emits no clause at all for 0, which
-  `render.py` accepts (only negatives are rejected). Documented by
-  `test_useage_zero_disables_the_age_guard`; the fix (refuse, or warn) is
-  deliberately deferred to an explicit decision and tracked in `TODO.md`.
+All three defects fixed above were found and fixed inside this release. The
+method is recorded because it is reusable, and because the reasoning is the
+expensive part to reconstruct later.
 
-- **`--useafter` is interpolated unquoted**, so the value lands as a bare SQL
-  identifier rather than a string literal. It is the only unquoted value in the
-  anti-join `WHERE` clause. Fail-closed in practice (unknown identifier), and
-  recorded as a strict `xfail` so it flips to a failure the moment it is fixed.
+- **`USEAGE_HOURS=0` was found by writing a test that asserted the dangerous
+  behaviour.** `if args.useage else ""` emitted no clause at all for 0, and
+  `render.py` accepted it because only negatives were rejected. A test named
+  `test_useage_zero_disables_the_age_guard` pinned that as the *existing*
+  behaviour first, which turned an unease into a decidable question: is a
+  zero-length age window ever legitimate? It is not — so a hard floor replaced
+  the warning originally proposed, and that test was retired in favour of
+  `test_useage_below_the_floor_is_refused`,
+  `test_useage_below_the_floor_is_refused_for_dry_run_too`,
+  `test_default_useage_is_the_safe_floor` and
+  `test_renderer_rejects_useage_below_the_floor`.
 
-- **The cluster/replica preflight is a point-in-time check**, run once, while
-  the anti-join is re-issued per sample over what can be hours. A replica
-  dropping out mid-run is not re-detected.
+- **`--useafter` was recorded as a strict `xfail` before it was fixed.** The
+  value was interpolated bare, so it landed as a SQL identifier rather than a
+  string literal — the only unquoted value in the anti-join `WHERE` clause, and
+  fail-closed in practice. Recording it *strictly* meant the suite would break
+  the moment anyone fixed it without noticing, which is exactly what happened:
+  the `xfail` flipped to XPASS and became a real assertion.
+
+- **The point-in-time preflight was found by reading the delete path for
+  lifetime mismatches**, not by a failure. The check ran once, while the
+  anti-join is re-issued per sample over what can be hours. A replica dropping
+  out mid-run took its references with it, so blobs it alone held began to look
+  orphaned — and nothing re-checked. It is now verified before every sample.
 
 ## [0.6.0] - 2026-08-19
 

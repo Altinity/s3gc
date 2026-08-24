@@ -100,6 +100,15 @@ Fill `s3gc.env` from `example.env`. For production, start with
 `SAMPLES=4`, `USEAGE_HOURS=24`, `ORDER_BY_OBJPATH=false`, and a 12-hour
 deadline.
 
+> **`USEAGE_HOURS` has a hard floor of 24 and the renderer enforces it.**
+> ClickHouse uploads a part's blobs to S3 and registers them in
+> `system.remote_data_paths` a moment later. In that window a live blob looks
+> orphaned, and nothing re-checks it before the delete — so this window is the
+> only thing protecting a part that is still being written. Raise it if a
+> cluster has slow merges or long mutations; you cannot lower it. The one
+> exception is `PHASE=dev-automation`, which seeds and deletes its own fixtures
+> and is already documented as non-production.
+
 Before the first *full* delete against a newly published image or a cluster you
 have not deleted from before, run one bounded delete with `USETOTAL` set to a
 few thousand. It exercises the whole path — anti-join, S3 deletion, tombstone

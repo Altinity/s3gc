@@ -90,6 +90,7 @@ def args_factory():
             # tests that do not opt in are unaffected by these.
             "runlog_flag": True,
             "runid": "test-run",
+            "dev_allow_short_useage": False,
             # S3 auth surface (static | aws | iam)
             "s3auth": "static",
             "s3profile": "",
@@ -304,8 +305,8 @@ def test_dev_automation_entrypoint_runs_collect_dry_run_and_delete(tmp_path):
     assert result.returncode == 0
     assert calls_path.read_text().splitlines() == [
         "/app/s3gc.py --collectonly --keepdata --drop-collecttable",
-        "/app/s3gc.py --usecollected --dry-run",
-        "/app/s3gc.py --usecollected --keepdata --non-interactive",
+        "/app/s3gc.py --usecollected --dry-run --dev-allow-short-useage=true",
+        "/app/s3gc.py --usecollected --keepdata --non-interactive --dev-allow-short-useage=true",
     ]
 
 
@@ -315,7 +316,7 @@ def test_dev_automation_entrypoint_stops_after_an_error(tmp_path):
     fake_python.write_text(
         "#!/bin/sh\n"
         "printf '%s\\n' \"$*\" >> \"$CALLS_PATH\"\n"
-        "case \"$*\" in *--dry-run) exit 42 ;; esac\n"
+        "case \"$*\" in *--dry-run*) exit 42 ;; esac\n"
     )
     fake_python.chmod(0o755)
 
@@ -338,7 +339,7 @@ def test_dev_automation_entrypoint_stops_after_an_error(tmp_path):
     assert result.returncode == 42
     assert calls_path.read_text().splitlines() == [
         "/app/s3gc.py --collectonly --keepdata --drop-collecttable",
-        "/app/s3gc.py --usecollected --dry-run",
+        "/app/s3gc.py --usecollected --dry-run --dev-allow-short-useage=true",
     ]
 
 
@@ -1061,18 +1062,96 @@ def test_age_guard_excludes_recently_written_objects(
     assert "s3o.last_modified < now() - interval 24 hour" in sql
 
 
-def test_useage_zero_disables_the_age_guard(s3gc_module, args_factory, monkeypatch):
-    """Documents a HAZARD, not a desired behaviour.
+@pytest.mark.parametrize("hours", [0, 1, 23])
+def test_useage_below_the_floor_is_refused(
+    s3gc_module, args_factory, monkeypatch, hours
+):
+    """The age window is a floor, not a default to be talked down.
 
-    `if args.useage else ""` means useage=0 emits no age clause, and
-    render.py accepts USEAGE_HOURS=0 (only negatives are rejected). A run
-    configured that way has no protection against the mid-write window above.
-    If s3gc is later changed to refuse or warn on 0, this test should fail and
-    be updated deliberately.
+    Below 24 hours a run can delete a part between its upload to S3 and its
+    registration in remote_data_paths. Refused outright rather than warned
+    about, and refused before the cluster preflight or any S3 call.
     """
-    sql = _antijoin_sql(s3gc_module, args_factory, monkeypatch, useage=0)
+    namespace = s3gc_module["do_use"].__globals__
+    monkeypatch.setitem(namespace, "args", args_factory(useage=hours))
+    monkeypatch.setitem(namespace, "ch_client", FakeCH())
 
-    assert "interval" not in sql
+    with pytest.raises(s3gc_module["UserVisibleError"], match="below the 24 hour minimum"):
+        s3gc_module["do_use"]()
+
+
+@pytest.mark.parametrize("hours", [0, 1, 23])
+def test_useage_below_the_floor_is_refused_for_dry_run_too(
+    s3gc_module, args_factory, monkeypatch, hours
+):
+    """A preview wider than the delete would honour is worse than no preview."""
+    namespace = s3gc_module["do_use"].__globals__
+    monkeypatch.setitem(
+        namespace, "args", args_factory(useage=hours, dryrun_flag=True)
+    )
+    monkeypatch.setitem(namespace, "ch_client", FakeCH())
+
+    with pytest.raises(s3gc_module["UserVisibleError"], match="below the 24 hour minimum"):
+        s3gc_module["do_use"]()
+
+
+def test_useage_at_the_floor_is_accepted(s3gc_module, args_factory, monkeypatch):
+    sql = _antijoin_sql(s3gc_module, args_factory, monkeypatch, useage=24)
+
+    assert "s3o.last_modified < now() - interval 24 hour" in sql
+
+
+def test_useage_above_the_floor_is_accepted(s3gc_module, args_factory, monkeypatch):
+    """The parameter stays useful upward: more caution must remain possible."""
+    sql = _antijoin_sql(s3gc_module, args_factory, monkeypatch, useage=168)
+
+    assert "s3o.last_modified < now() - interval 168 hour" in sql
+
+
+def test_default_useage_is_the_safe_floor(monkeypatch):
+    """A bare run must not opt itself out of the guard."""
+    module = _load_with_env(monkeypatch)
+
+    assert module["args"].useage == 24
+    assert module["MINIMUM_USEAGE_HOURS"] == 24
+
+
+def test_dev_flag_permits_a_short_window_but_says_so(
+    s3gc_module, args_factory, monkeypatch, caplog
+):
+    """Development automation seeds and deletes fixtures within minutes.
+
+    The escape hatch is reachable only through the dev-automation entrypoint
+    phase, and a run that uses it must be impossible to mistake for a normal
+    one -- hence the warning and the durable run-log row.
+    """
+    namespace = s3gc_module["do_use"].__globals__
+    writer = RecordingCH()
+    monkeypatch.setitem(
+        namespace,
+        "args",
+        args_factory(useage=0, dryrun_flag=True, dev_allow_short_useage=True),
+    )
+    monkeypatch.setitem(namespace, "ch_client", FakeCH())
+    monkeypatch.setitem(namespace, "ch_writer", writer)
+    monkeypatch.setitem(namespace, "run_log_enabled", True)
+    monkeypatch.setitem(namespace, "run_id", "dev-run")
+    monkeypatch.setitem(namespace, "log_tname", "`aux_log`")
+
+    with caplog.at_level("WARNING", logger="s3gc_test"):
+        s3gc_module["do_use"]()
+
+    assert "dev-allow-short-useage" in caplog.text
+    events = [
+        (row[3], row[4])
+        for table, rows, _ in writer.inserts
+        if table == "`aux_log`"
+        for row in rows
+    ]
+    assert any(
+        event == "warning" and "below the 24h minimum" in message
+        for event, message in events
+    )
 
 
 def test_dry_run_performs_no_s3_operations(s3gc_module, args_factory, monkeypatch):
@@ -1492,3 +1571,71 @@ def test_renderer_uses_the_job_name_as_the_run_id(tmp_path):
     assert result.returncode == 0
     assert "- name: S3GC_RUNID" in result.stdout
     assert 'value: "s3gc-example-dry-run"' in result.stdout
+
+
+@pytest.mark.parametrize("hours", ["0", "1", "23"])
+def test_renderer_rejects_useage_below_the_floor(tmp_path, hours):
+    """A bad window must fail at render time, not after a Job is applied."""
+    source = (ROOT / "deploy/kubernetes/example.env").read_text()
+    config_path = tmp_path / "short.env"
+    config_path.write_text(source.replace("USEAGE_HOURS=24", f"USEAGE_HOURS={hours}"))
+
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "deploy/kubernetes/render.py"), config_path],
+        capture_output=True, text=True, check=False,
+    )
+
+    assert result.returncode == 64
+    assert "USEAGE_HOURS must be at least 24" in result.stderr
+
+
+def test_renderer_allows_a_short_window_for_dev_automation(tmp_path):
+    """The one non-production phase, already documented as such."""
+    source = (ROOT / "deploy/kubernetes/example.env").read_text()
+    config_path = tmp_path / "dev.env"
+    config_path.write_text(
+        source.replace("USEAGE_HOURS=24", "USEAGE_HOURS=0")
+        .replace("PHASE=dry-run", "PHASE=dev-automation")
+        .replace("DELETE_CONFIRMATION=", "DELETE_CONFIRMATION=DELETE_ORPHANS")
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "deploy/kubernetes/render.py"), config_path],
+        capture_output=True, text=True, check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert 'value: "0"' in result.stdout
+
+
+def test_only_dev_automation_passes_the_short_window_flag(tmp_path):
+    """The prod phases must never hand s3gc the escape hatch."""
+    calls_path = tmp_path / "calls"
+    fake_python = tmp_path / "python"
+    fake_python.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CALLS_PATH\"\n"
+    )
+    fake_python.chmod(0o755)
+
+    def run(phase):
+        calls_path.write_text("")
+        subprocess.run(
+            ["sh", str(ROOT / "docker/kubernetes-entrypoint.sh")],
+            env={
+                **os.environ,
+                "PATH": f"{tmp_path}:{os.environ['PATH']}",
+                "CALLS_PATH": str(calls_path),
+                "S3GC_PHASE": phase,
+                "S3GC_DELETE_CONFIRMATION": "DELETE_ORPHANS",
+                "S3GC_CLUSTERNAME": "cluster",
+                "S3GC_EXPECTED_REPLICAS": "2",
+            },
+            capture_output=True, text=True, check=False,
+        )
+        return calls_path.read_text()
+
+    for phase in ("collect", "dry-run", "delete"):
+        assert "--dev-allow-short-useage" not in run(phase), phase
+    dev_calls = run("dev-automation")
+    assert dev_calls.count("--dev-allow-short-useage=true") == 2
+    assert "--dev-allow-short-useage\n" not in dev_calls

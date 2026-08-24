@@ -42,6 +42,9 @@ REQUIRED = {
     "VERBOSE",
 }
 DELETE_CONFIRMATION = "DELETE_ORPHANS"
+# Mirrors MINIMUM_USEAGE_HOURS in s3gc.py. Enforced here as well so a bad value
+# fails at render time rather than after a Job has been applied to a cluster.
+MINIMUM_USEAGE_HOURS = 24
 # Optional keys and their defaults. An empty value renders no environment
 # variable at all, because s3gc parses S3GC_USETOTAL as an integer and would
 # reject an empty string.
@@ -90,8 +93,19 @@ def validate(values: dict[str, str]) -> None:
     for numeric_key in ("DELETE_BATCH_SIZE", "EXPECTED_REPLICAS", "SAMPLES", "ACTIVE_DEADLINE_SECONDS", "TTL_SECONDS_AFTER_FINISHED"):
         if not values[numeric_key].isdigit() or int(values[numeric_key]) < 1:
             raise ValueError(f"{numeric_key} must be a positive integer")
-    if not values["USEAGE_HOURS"].isdigit() or int(values["USEAGE_HOURS"]) < 0:
+    if not values["USEAGE_HOURS"].isdigit():
         raise ValueError("USEAGE_HOURS must be a non-negative integer")
+    # dev-automation seeds and deletes its own fixtures within minutes, and is
+    # already documented as non-production. Every other phase gets the floor.
+    if (
+        int(values["USEAGE_HOURS"]) < MINIMUM_USEAGE_HOURS
+        and values["PHASE"] != "dev-automation"
+    ):
+        raise ValueError(
+            f"USEAGE_HOURS must be at least {MINIMUM_USEAGE_HOURS} for PHASE={values['PHASE']}: "
+            "the age window is the only protection against deleting a part between "
+            "its upload to S3 and its registration in system.remote_data_paths"
+        )
     if values["S3AUTH"] not in {"static", "aws", "iam"}:
         raise ValueError("S3AUTH must be static, aws or iam")
     if values["S3PROFILE"] and values["S3AUTH"] != "aws":

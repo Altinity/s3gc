@@ -36,12 +36,16 @@ case "${phase}" in
 
     # A fresh collection avoids mixing prior runs and their tombstones into an
     # automated development run. `set -e` stops subsequent stages on error.
+    # Development fixtures are seeded and deleted within minutes, so this phase
+    # -- and ONLY this phase -- may run below the 24 hour age minimum that
+    # protects a part between its upload to S3 and its registration in
+    # system.remote_data_paths. The prod phases above never pass this flag.
     echo "s3gc dev automation: collect"
     python /app/s3gc.py --collectonly --keepdata --drop-collecttable
     echo "s3gc dev automation: dry-run"
-    python /app/s3gc.py --usecollected --dry-run
+    python /app/s3gc.py --usecollected --dry-run --dev-allow-short-useage=true
     echo "s3gc dev automation: delete"
-    exec python /app/s3gc.py --usecollected --keepdata --non-interactive
+    exec python /app/s3gc.py --usecollected --keepdata --non-interactive --dev-allow-short-useage=true
     ;;
   *)
     echo "Invalid S3GC_PHASE=${phase}; use collect, dry-run, delete, or dev-automation" >&2

@@ -13,3 +13,11 @@ forward-looking backlog.
   fixtures, and remain excluded from CI.
 - [ ] Require the `Container / test` GitHub Actions check before pull-request
   merges in the repository branch-protection settings.
+- [ ] Decide what `USEAGE_HOURS=0` should do. It disables the age window that
+  is the only guard against deleting a part between its blob upload and its
+  registration in `system.remote_data_paths`. Options: reject it in
+  `render.py`, warn loudly in `s3gc.py`, or leave it and document it. Covered
+  today only by a test that documents the hazard.
+- [ ] Quote `--useafter` as a SQL string literal (strict `xfail` in the suite).
+- [ ] Consider re-checking cluster topology per sample, not once per run, so a
+  replica lost mid-run cannot widen the deletion scope.

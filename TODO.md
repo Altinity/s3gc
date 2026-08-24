@@ -13,15 +13,12 @@ forward-looking backlog.
   fixtures, and remain excluded from CI.
 - [ ] Require the `Container / test` GitHub Actions check before pull-request
   merges in the repository branch-protection settings.
-- [ ] Quote `--useafter` as a SQL string literal (strict `xfail` in the suite).
-- [ ] Consider re-checking cluster topology per sample, not once per run, so a
-  replica lost mid-run cannot widen the deletion scope.
-- [ ] `print()` output is block-buffered because the image sets no
-  `PYTHONUNBUFFERED` and stdout is a pipe under Kubernetes. Logger records are
-  flushed per line, but the bare prints — including the closing `s3gc: OK` —
-  are lost when `activeDeadlineSeconds` fires and the kubelet sends SIGTERM.
-  The durable run log now covers the evidence case; this remains a stdout
-  fidelity gap, and it also makes the `dev-automation` phase markers interleave
-  wrongly against the shell's unbuffered `echo`.
 - [ ] Consider a `TTL` on the run-log table. Volume is a few hundred rows per
   run so it is not urgent, but it grows without bound across many cleanups.
+- [ ] Drop the redundant top-level `preflight_cluster()` call in `do_use()`.
+  Since the per-sample re-check landed there are two call sites, and the
+  top-level one only buys failing about one query earlier. It also makes the
+  M7 mutation ("remove the preflight call") survive the suite, because removing
+  either site alone is covered by the other. Removing site A and retargeting M7
+  at the per-sample call restores a clean 11/11. Not a defect — removing both
+  sites still fails two tests.

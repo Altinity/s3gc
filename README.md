@@ -84,6 +84,23 @@ For Claude Code, substitute `~/.claude/skills`. Invoke it with
 The skill does not permit an agent to supply the deletion confirmation; an
 authorized human must approve the reviewed dry-run result.
 
+## AI coding workflow
+
+This repo uses `CLAUDE.md` (full guide) and `AGENTS.md` (short pointer) to
+tell AI coding agents how to work here. If you ask an agent to fix a bug or
+add a feature, here's what it does:
+
+1. **Spec Intake** — if you didn't give enough detail, the agent asks a few
+   short questions: what's happening vs. what should happen, how to trigger
+   it, whether it touches the delete lifecycle, and any known edge cases.
+2. **Spec** — the agent writes a short spec (problem + acceptance criteria)
+   in the commit that starts the change.
+3. **TDD** — for each acceptance criterion, the agent writes a failing test,
+   then makes it pass.
+
+This applies to new features, bug fixes, and behaviour changes. Editorial
+changes (docs, comments) skip it. See `CLAUDE.md` for the full rules.
+
 ## Direct script examples
 
 The following is a non-secret target configuration. Replace every

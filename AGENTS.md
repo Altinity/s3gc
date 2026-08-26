@@ -17,12 +17,14 @@ quickly, then defer to `CLAUDE.md` for complete repository guidance.
    objects only after collection, dry-run review, explicit confirmation, and
    the applicable ClickHouse cluster/replica preflight. Do not weaken these
    controls without explicit approval and matching tests and documentation.
-3. **Test coverage and required checks are mandatory.** For every feature,
-   bug fix, or material behaviour change, add a focused test when no existing
-   test covers it; use test-driven development for behaviour changes. Run the
-   relevant offline pytest suite and Kubernetes renderer/manifest dry-run
-   checks described in `CLAUDE.md`. Automated tests must not contact live
-   ClickHouse or object storage, or delete objects.
+3. **Spec-first TDD and required checks are mandatory.** For every feature,
+   bug fix, or material behaviour change, start with a short spec (problem +
+   acceptance criteria) in the starting commit. If the request doesn't already
+   answer that, run Spec Intake first (see `CLAUDE.md`). Then use test-driven
+   development to satisfy each criterion. Run the relevant offline pytest
+   suite and Kubernetes renderer/manifest dry-run checks described in
+   `CLAUDE.md`. Automated tests must not contact live ClickHouse or object
+   storage, or delete objects.
 4. **No secrets or customer data in Git.** Never commit credentials, customer
    configuration, target-cluster details, or rendered customer manifests. Use
    Kubernetes Secrets or workload identity for production credentials.

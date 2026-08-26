@@ -18,10 +18,11 @@ tests, explicit delete controls, and conservative deployment defaults.
    material operational behaviour change, start with a short spec in the
    commit that begins the change: one or two sentences on the problem or
    intent, plus a short bullet list of acceptance criteria — what must be true
-   when it's done. Then use TDD: for each acceptance criterion, write the
-   failing test that covers it before making it pass. Add a regression test
-   for every defect. Purely editorial changes are exempt from both the spec
-   and TDD.
+   when it's done. If the request doesn't already answer these, run Spec
+   Intake first (see below). Then use TDD: for each acceptance criterion,
+   write the failing test that covers it before making it pass. Add a
+   regression test for every defect. Purely editorial changes are exempt from
+   both the spec and TDD.
 
 3. **Tests stay offline by default.** Install both requirements files, then
    run `pytest -v` for relevant changes. Tests must use fakes, local
@@ -52,6 +53,20 @@ tests, explicit delete controls, and conservative deployment defaults.
    `CHANGELOG.md` for recent behaviour and operational evidence, then `TODO.md`
    for possible, interesting, and deliberately deferred improvements. Do not
    treat a TODO item as already implemented or use the changelog as a backlog.
+
+## Spec Intake
+
+When someone reports a bug or asks for a feature without enough detail to
+write a spec, ask:
+
+1. What's happening, and what should happen instead?
+2. How do you trigger it (steps or command)?
+3. Does this touch the delete lifecycle (collect → dry-run → delete → verify)
+   or a safety check?
+4. Any known edge cases, or things this must not break?
+
+Use the answers to write the spec's acceptance criteria. If the report
+already answers these, skip straight to the spec.
 
 ## Repository map
 

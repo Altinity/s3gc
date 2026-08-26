@@ -19,7 +19,8 @@ quickly, then defer to `CLAUDE.md` for complete repository guidance.
    controls without explicit approval and matching tests and documentation.
 3. **Spec-first TDD and required checks are mandatory.** For every feature,
    bug fix, or material behaviour change, start with a short spec (problem +
-   acceptance criteria) in the starting commit, then use test-driven
+   acceptance criteria) in the starting commit. If the request doesn't already
+   answer that, run Spec Intake first (see `CLAUDE.md`). Then use test-driven
    development to satisfy each criterion. Run the relevant offline pytest
    suite and Kubernetes renderer/manifest dry-run checks described in
    `CLAUDE.md`. Automated tests must not contact live ClickHouse or object

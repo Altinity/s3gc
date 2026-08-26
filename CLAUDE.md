@@ -14,11 +14,14 @@ tests, explicit delete controls, and conservative deployment defaults.
    not retry automatically. A behavior change in this path needs regression
    tests and matching README/deployment documentation.
 
-2. **Test coverage and TDD are mandatory.** For every new feature, bug fix, or
-   material operational behaviour change, identify the test that covers it; if
-   none exists, add a focused test in the same change. Start behaviour changes
-   with a failing test, and add a regression test for every defect. Purely
-   editorial changes are exempt.
+2. **Spec-first TDD is mandatory.** For every new feature, bug fix, or
+   material operational behaviour change, start with a short spec in the
+   commit that begins the change: one or two sentences on the problem or
+   intent, plus a short bullet list of acceptance criteria — what must be true
+   when it's done. Then use TDD: for each acceptance criterion, write the
+   failing test that covers it before making it pass. Add a regression test
+   for every defect. Purely editorial changes are exempt from both the spec
+   and TDD.
 
 3. **Tests stay offline by default.** Install both requirements files, then
    run `pytest -v` for relevant changes. Tests must use fakes, local

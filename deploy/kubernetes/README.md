@@ -1,83 +1,24 @@
 # Kubernetes Job runner
 
-Run `s3gc` as a one-shot Job in the ClickHouse namespace. For customer and
-production work, always run:
+Run `s3gc` as a one-shot Job in the ClickHouse namespace. This guide is the
+production procedure.
 
-```text
-collect → dry-run → approved delete → verify
+## Prerequisite
+
+Use Python 3.11 from the repository root. Create the project virtual
+environment before you render a Job:
+
+```bash
+python3.11 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt -r requirements-dev.txt
 ```
 
-The Job reaches ClickHouse through an in-cluster Service; no laptop tunnel is
-needed.
+`render.py` uses only the Python standard library. The runbook still uses
+`.venv/bin/python` so every command runs with the supported Python version.
 
-> **`CHHOST` must be a PER-REPLICA Service, never the load-balanced one.**
-> The auxiliary table is a node-local `ReplacingMergeTree`, not a Replicated
-> table. A load-balanced Service round-robins, so `collect` can write the table
-> on one replica while `dry-run`/`delete` land on another and find nothing.
-> Use `chi-<chi>-<cluster>-0-0` (replica 0), not `clickhouse-<cluster>`, and use
-> the **same** host for every phase of a cleanup.
+## Runbook
 
-## Before the first Job
-
-- Use an immutable, multi-architecture image digest:
-  `ghcr.io/altinity/s3gc@sha256:<digest>`. CI prints the exact `IMAGE=` line in
-  its job summary. Pin by digest, never by tag — tags get re-pushed.
-- The image must be multi-arch. ClickHouse node pools are often arm64 (one
-  customer cluster is 5x arm64 + 1x amd64), and an amd64-only image simply will
-  not schedule there.
-- Create or reuse a namespace-local ServiceAccount.
-- Create a runtime Secret named by `CREDENTIALS_SECRET`:
-  - `S3AUTH=static`: `S3GC_CHUSER`, `S3GC_CHPASS`, `S3GC_S3ACCESSKEY`,
-    `S3GC_S3SECRETKEY`, plus `S3GC_S3SESSIONTOKEN` for temporary credentials.
-  - `S3AUTH=iam`: only `S3GC_CHUSER` and `S3GC_CHPASS`, with an
-    identity-enabled ServiceAccount. Note the template sets
-    `automountServiceAccountToken: false`, so `iam` also needs a ServiceAccount
-    that actually projects a token.
-- Confirm the ClickHouse Service name, cluster macro, expected replica count,
-  S3 bucket/prefix, and disk name. Use a unique `COLLECTTABLEPREFIX` per
-  bucket/prefix cleanup.
-
-### Choosing `S3AUTH`
-
-| `S3AUTH` | Credentials | Needs boto3 | Use when |
-|---|---|---|---|
-| `iam` (default here) | MinIO workload identity — IRSA, IMDS, ECS task role | no | the normal Kubernetes case |
-| `static` | `S3GC_S3ACCESSKEY`/`S3GC_S3SECRETKEY` (+ optional `S3GC_S3SESSIONTOKEN`) from the Secret | no | no workload identity available |
-| `aws` | boto3 chain, optionally `S3PROFILE` | **yes** | rarely in-cluster; this is a workstation SSO path |
-
-`S3PROFILE` requires `S3AUTH=aws` and the renderer rejects other combinations.
-
-Prefer `iam`: it hands MinIO the credential provider, so temporary credentials
-refresh during a long collect or delete instead of expiring mid-run.
-
-### Minimum ClickHouse grants
-
-Create or provision a dedicated ClickHouse user for `s3gc`, then grant it:
-
-```sql
-GRANT SELECT ON system.*                        TO s3gc;  -- remote_data_paths, one, disks, tables
-GRANT SELECT, INSERT, CREATE TABLE ON <db>.*    TO s3gc;  -- auxiliary + run-log tables
-```
-
-### Values that vary per cluster, and bite when wrong
-
-- **`S3PATH` may legitimately be empty** — some buckets keep blobs at the root.
-  A wrong prefix silently lists nothing and reports a clean bucket.
-- **The disk is not always called `s3`** — GCS-backed clusters commonly use
-  `gcs`. `S3DISKNAME` sets both the anti-join scope and the aux table name, so
-  the wrong value makes *every* blob look orphaned.
-- **A `*_cache` disk is a filesystem cache over the same blobs**, not a second
-  reference scope; scope the anti-join to the underlying object disk.
-- **`SAMPLES` must match the value used at collect time** — the aux table is
-  `PARTITION BY CRC32(objpath) % SAMPLES`, and a mismatch loses partition
-  pruning (measured: ~2 min vs ~26 min per sample). s3gc now warns on mismatch.
-- **GCS has no batch delete** — s3gc detects a `storage.googleapis.com` endpoint
-  and falls back to one request per object, which is markedly slower.
-
-Never commit credentials, rendered customer manifests, or customer `.env`
-files to this repository.
-
-## Local run directory
+### 1. Prepare a private run directory
 
 Keep generated files outside this repository:
 
@@ -86,6 +27,9 @@ export S3GC_RUN_DIR=/path/to/private-s3gc-runs/customer-cluster
 mkdir -p "$S3GC_RUN_DIR"
 cp deploy/kubernetes/example.env "$S3GC_RUN_DIR/s3gc.env"
 ```
+
+The directory will contain the non-secret configuration and one rendered
+manifest for each phase:
 
 ```text
 $S3GC_RUN_DIR/
@@ -96,68 +40,109 @@ $S3GC_RUN_DIR/
 └── verify.yaml
 ```
 
-Fill `s3gc.env` from `example.env`. For production, start with
-`SAMPLES=4`, `USEAGE_HOURS=24`, `ORDER_BY_OBJPATH=false`, and a 12-hour
-deadline.
+Do not commit this directory. It identifies a target environment even when it
+contains no credentials.
 
-> **`USEAGE_HOURS` has a hard floor of 24 and the renderer enforces it.**
-> ClickHouse uploads a part's blobs to S3 and registers them in
-> `system.remote_data_paths` a moment later. In that window a live blob looks
-> orphaned, and nothing re-checks it before the delete — so this window is the
-> only thing protecting a part that is still being written. Raise it if a
-> cluster has slow merges or long mutations; you cannot lower it. The one
-> exception is `PHASE=dev-automation`, which seeds and deletes its own fixtures
-> and is already documented as non-production.
+### 2. Confirm the cleanup scope
 
-Before the first *full* delete against a newly published image or a cluster you
-have not deleted from before, run one bounded delete with `USETOTAL` set to a
-few thousand. It exercises the whole path — anti-join, S3 deletion, tombstone
-write-back — in minutes, and a failure costs you that instead of a multi-hour
-run that dies partway with objects already removed. Clear `USETOTAL` for the
-real run.
+Set the values in `s3gc.env`, then check these five items before rendering:
 
-## Run each phase
+1. Set `CHHOST` to one per-replica ClickHouse Service and use the same host for every phase. The inventory table is node-local; a load-balanced Service can send a later phase to a replica without that table.
+2. Set the exact bucket, prefix, and underlying object-disk name. `S3PATH` may be empty. GCS commonly uses `gcs`; never use a `*_cache` disk.
+3. Set the actual `CLUSTERNAME` and `EXPECTED_REPLICAS` for clustered cleanup. Delete fails closed if this preflight does not match.
+4. Choose a unique `COLLECTTABLEPREFIX`. Keep it after a partial delete so the replacement Job can use the deletion checkpoints.
+5. Set `USEAGE_HOURS` to 24 or more. Raise it for slow merges or long mutations; production phases cannot lower it.
 
-For each phase, update only `PHASE`, `JOB_NAME`, and (for delete)
-`DELETE_CONFIRMATION` in `s3gc.env`, then render and apply:
+Use an immutable multi-architecture image digest in `IMAGE`. CI prints the
+exact value after publishing. Do not use an image tag.
+
+Collection has no resume checkpoint. For a large bucket, collect separate
+prefix shards and rerun only a failed shard. Re-listing a shard is safe because
+the auxiliary table replaces rows by object path.
+
+### 3. Provide credentials and identity
+
+Create or reuse the Kubernetes Secret named by `CREDENTIALS_SECRET`:
+
+| `S3AUTH` | Secret values |
+| --- | --- |
+| `static` | `S3GC_CHUSER`, `S3GC_CHPASS`, `S3GC_S3ACCESSKEY`, `S3GC_S3SECRETKEY`, and an optional `S3GC_S3SESSIONTOKEN` |
+| `iam` | `S3GC_CHUSER` and `S3GC_CHPASS` |
+| `aws` | `S3GC_CHUSER`, `S3GC_CHPASS`, plus a credential source available to boto3 |
+
+Set `SERVICE_ACCOUNT` to an existing namespace-local ServiceAccount that your
+cluster configures for the chosen workload-identity mode. The Job keeps
+`automountServiceAccountToken: false` because it does not call the Kubernetes
+API. For `iam`, the platform must inject or otherwise provide the workload
+identity credentials. Existing ClickHouse or ClickHouse-backup ServiceAccounts
+are suitable when they meet that cluster policy.
+
+Create or provision a dedicated ClickHouse user with the required grants:
+
+```sql
+GRANT SELECT ON system.*                     TO s3gc;
+GRANT SELECT, INSERT, CREATE TABLE ON <db>.* TO s3gc;
+```
+
+The second grant covers the auxiliary inventory and durable run-log tables.
+
+### 4. Run each phase
+
+For each phase, edit only the values shown below, render the Job, server-side
+validate it, apply it, and follow its logs:
 
 ```bash
-python3 deploy/kubernetes/render.py "$S3GC_RUN_DIR/s3gc.env" \
+.venv/bin/python deploy/kubernetes/render.py "$S3GC_RUN_DIR/s3gc.env" \
   > "$S3GC_RUN_DIR/<phase>.yaml"
 kubectl apply --dry-run=server -f "$S3GC_RUN_DIR/<phase>.yaml"
 kubectl apply -f "$S3GC_RUN_DIR/<phase>.yaml"
 kubectl -n <namespace> logs -f job/<job-name>
 ```
 
-| Phase | Required values | Result |
-|---|---|---|
-| `collect` | `PHASE=collect` | Lists S3 objects into the auxiliary ClickHouse table. No deletion. |
-| `dry-run` | `PHASE=dry-run` | Reports candidates and total size. Review this result. |
-| `delete` | `PHASE=delete`, `DELETE_CONFIRMATION=DELETE_ORPHANS` | Checks cluster/replicas, deletes candidates, and checkpoints confirmed progress. |
-| `verify` | `PHASE=dry-run` | Must report zero candidates. |
+| Phase | Change in `s3gc.env` | Required outcome |
+| --- | --- | --- |
+| Collect | Set `PHASE=collect` and a new `JOB_NAME`. | Inventory S3 objects. No deletion occurs. |
+| Review | Set `PHASE=dry-run` and a new `JOB_NAME`. | Review the candidate count, bytes, bucket, and prefix. |
+| Delete | After written human approval, set `PHASE=delete`, a new `JOB_NAME`, and `DELETE_CONFIRMATION=DELETE_ORPHANS`. | Delete and checkpoint confirmed batches. |
+| Verify | Set `PHASE=dry-run`, a new `JOB_NAME`, and clear `DELETE_CONFIRMATION`. | Report zero candidates. |
 
-### Development automation only
+Do not run delete from an unreviewed dry-run. Before the first full delete for
+a new image or cluster, set `USETOTAL` to a few thousand objects for one
+bounded delete. Clear it before the full run.
 
-`PHASE=dev-automation` runs `collect → dry-run → delete` in one Job. It always
-starts with a fresh auxiliary table and requires
-`DELETE_CONFIRMATION=DELETE_ORPHANS`, `CLUSTERNAME`, and `EXPECTED_REPLICAS`.
-Any failed stage stops the Job and later stages do not run; successful delete
-batches remain checkpointed. Do not use this phase for customer or production
-work because it removes the manual dry-run approval gate.
+### 5. Recover or verify
+
+If a delete Job fails, create a replacement delete Job with a new `JOB_NAME`
+and the same `COLLECTTABLEPREFIX`. Do not re-collect unless the scope changed.
+`backoffLimit: 0` prevents automatic retries.
+
+After a successful delete, run the verification dry-run. Do not declare the
+cleanup complete until it reports zero candidates.
+
+## Configuration reference
+
+`render.py` reads a non-secret `KEY=VALUE` file. It rejects missing required
+values, unpinned images, invalid phases, invalid booleans, and unsafe age
+windows. Start with [example.env](example.env).
+
+| Group | Required values | Notes |
+| --- | --- | --- |
+| Job | `JOB_NAME`, `NAMESPACE`, `IMAGE`, `IMAGE_PULL_SECRET`, `SERVICE_ACCOUNT`, `CREDENTIALS_SECRET` | `JOB_NAME` is a DNS label and becomes the durable run ID. Leave `IMAGE_PULL_SECRET` empty for the public image. |
+| ClickHouse | `CHHOST`, `CHPORT`, `CLUSTERNAME`, `EXPECTED_REPLICAS`, `COLLECTTABLEPREFIX` | Pin `CHHOST` to one replica for the entire cleanup. |
+| Object store | `S3IP`, `S3PORT`, `S3BUCKET`, `S3PATH`, `S3REGION`, `S3SECURE_FLAG`, `S3DISKNAME`, `S3AUTH`, `S3PROFILE` | `S3PROFILE` requires `S3AUTH=aws`. |
+| Limits | `SAMPLES`, `DELETE_BATCH_SIZE`, `USEAGE_HOURS`, `ACTIVE_DEADLINE_SECONDS`, `TTL_SECONDS_AFTER_FINISHED`, `MEMORY_REQUEST`, `MEMORY_LIMIT` | Keep `SAMPLES` unchanged after collect for partition pruning. |
+| Behavior | `PHASE`, `DELETE_CONFIRMATION`, `ORDER_BY_OBJPATH`, `VERBOSE` | The renderer requires the confirmation token for delete and development automation. |
+
+`USETOTAL` is optional and limits one use phase. `RUNLOG` defaults to `true`;
+set it to `false` only when stdout is an adequate operational record.
 
 ## Durable run history
 
-Pod logs are **not** a record. The kubelet rotates container output, so
-`kubectl logs` cannot return the start of a long run, and
-`ttlSecondsAfterFinished` deletes the Job and its pods along with everything
-they printed. `kubectl logs -f` is for watching, not for evidence.
+Pod logs are for monitoring, not durable evidence. The kubelet rotates them,
+and the Job TTL removes the pod. By default, `s3gc` writes run events to
+`<COLLECTTABLEPREFIX><S3DISKNAME>_log` in ClickHouse.
 
-So each run also appends to `<COLLECTTABLEPREFIX><S3DISKNAME>_log` in
-ClickHouse, beside the auxiliary table. That table is **never truncated**, and
-`S3GC_RUNID` is set to the Job name, so a row traces back to the Job that wrote
-it long after the pod is gone.
-
-What a delete actually did, on the same replica-pinned `CHHOST`:
+Use the same replica-pinned host to inspect a run:
 
 ```sql
 SELECT event_time, phase, event, objects, bytes, message
@@ -166,34 +151,22 @@ WHERE  run_id = '<job-name>'
 ORDER BY event_time;
 ```
 
-How far a *failed* delete got before it died, which is what tells you whether to
-start a replacement delete Job:
+For a failed delete, inspect the latest `checkpoint` event before starting its
+replacement Job. A run-log write failure falls back to stdout and does not stop
+the cleanup.
 
-```sql
-SELECT max(objects) AS deleted, max(bytes) AS reclaimed
-FROM   <db>.<prefix><disk>_log
-WHERE  run_id = '<job-name>' AND event = 'checkpoint';
-```
+## Development automation only
 
-Every phase of a cleanup, newest first:
+`PHASE=dev-automation` runs collect, dry-run, and delete in one Job. It starts
+with a fresh inventory and requires `DELETE_CONFIRMATION=DELETE_ORPHANS`,
+`CLUSTERNAME`, and `EXPECTED_REPLICAS`.
 
-```sql
-SELECT run_id, min(event_time) AS started, max(event_time) AS ended,
-       anyIf(message, event = 'error') AS error
-FROM   <db>.<prefix><disk>_log
-GROUP BY run_id ORDER BY started DESC;
-```
+Use it only for isolated development fixtures. It bypasses the manual review
+and approval gate, and it alone may use an age window below 24 hours.
 
-Set `RUNLOG=false` to opt out. A missing `CREATE TABLE` grant degrades to
-stdout only with one warning rather than failing the run, and a run-log write
-that fails mid-delete disables the log instead of stopping the deletion.
+## Preserved safeguards
 
-## Safety
-
-- Delete checks the local cluster macro and expected replica count before S3
-  calls.
-- Confirmed deletions are tombstoned in the auxiliary table. If a delete Job
-  fails, create a new delete Job name with the same table prefix; do **not**
-  re-collect.
-- No Job retries automatically (`backoffLimit: 0`).
-- Do not run delete until the customer explicitly approves the dry-run result.
+- The manifest runs as a non-root user with a read-only root filesystem and no Linux capabilities.
+- Credentials come from `CREDENTIALS_SECRET` or workload identity, never the image or environment file.
+- The renderer requires a digest-pinned image and validates delete confirmation before the Job reaches the cluster.
+- Delete requires the cluster/replica preflight, records checkpoints, and never retries automatically.

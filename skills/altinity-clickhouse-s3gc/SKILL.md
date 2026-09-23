@@ -12,7 +12,7 @@ and removing approved orphaned objects. It is not a generic S3 cleanup procedure
 ## Non-negotiable rules
 
 - Deletion is irreversible. For customer and production work, use the Kubernetes Job workflow:
-  **collect → dry-run → explicit customer approval → delete → verify**.
+  **collect → dry-run → explicit human approval → delete → verify**.
 - Scope the bucket and prefix as narrowly as possible. A wrong prefix can produce a misleading
   clean result or expand deletion scope.
 - Use the underlying object disk (for example `s3` or `gcs`) for `S3DISKNAME`, never its
@@ -25,6 +25,8 @@ and removing approved orphaned objects. It is not a generic S3 cleanup procedure
 - Use a unique `COLLECTTABLEPREFIX` for each bucket/prefix cleanup. Preserve it after a partial
   delete: confirmed deletions are checkpointed, and a replacement delete Job resumes from that
   state without re-collecting.
+- Keep `USEAGE_HOURS` at 24 or higher for production phases. This protects objects uploaded to S3
+  before ClickHouse has registered their paths.
 - An agent must not supply `DELETE_ORPHANS`, create a delete manifest with that token, or bypass
   the reviewed dry-run gate. A human must review the immediate dry-run output and explicitly
   authorize deletion.
@@ -44,13 +46,15 @@ for an in-cluster AWS cleanup; use static credentials only from a runtime Secret
 Read [the Kubernetes operator guide](../../deploy/kubernetes/README.md) and start from
 [`deploy/kubernetes/example.env`](../../deploy/kubernetes/example.env) copied to a private run
 directory outside the repository. Use an immutable multi-architecture image digest, not a tag.
+Select an existing namespace-local ServiceAccount configured for the cluster's intended workload
+identity mode; the runner does not need Kubernetes API credentials.
 
 ### 2. Collect and review
 
 Render and run a `collect` Job, then a `dry-run` Job against the same `CHHOST` and collection
-table. Collect does not delete; dry-run reports the candidate count and size. Capture the rendered
-configuration location and the non-secret Job/log evidence in the active support record without
-copying credentials or customer artifacts into Git.
+table. Collect does not delete; dry-run reports the candidate count and size. Review the exact
+bucket and prefix too. Capture the rendered configuration location and the non-secret Job/log
+evidence in the active support record without copying credentials or customer artifacts into Git.
 
 Treat an empty or missing collected inventory as a failure to investigate, not proof that the
 bucket is clean. Verify the prefix, disk name, and replica-pinned service first. For large buckets,
@@ -65,7 +69,8 @@ authorized customer/operator. Do not proceed without explicit approval.
 After the human supplies the delete confirmation in the private runtime configuration, render a
 new delete Job using the same collection-table prefix. Monitor it to completion. A failed delete
 Job has no automatic retry; start a replacement delete Job with the same prefix so the confirmed
-deletion checkpoints are preserved. Do not re-collect unless the scope itself changed.
+deletion checkpoints are preserved. Do not re-collect unless the scope itself changed. Keep the
+durable run log enabled unless stdout is the approved operational record.
 
 ### 4. Verify and hand off
 

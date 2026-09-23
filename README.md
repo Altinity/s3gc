@@ -1,46 +1,40 @@
 # s3gc
 
-`s3gc` finds and removes orphaned objects from ClickHouse S3 disks and other
-S3-compatible storage. An object is a candidate only when it exists under the
-configured bucket/prefix but is absent from ClickHouse
-`system.remote_data_paths` for the configured disk.
+`s3gc` finds orphaned objects on a ClickHouse S3 disk or compatible object
+store. It collects an inventory into ClickHouse, compares it with
+`system.remote_data_paths`, and reports objects that ClickHouse does not
+reference.
 
-## How it works
+For customer and production work, use the Kubernetes runbook:
 
-1. Collect object names, sizes, and timestamps into an auxiliary ClickHouse
-   table.
-2. Anti-join that inventory with `system.remote_data_paths` (or all replicas of
-   a configured cluster).
-3. Report candidates in dry-run mode, or delete them in batches and record
-   confirmed deletion checkpoints in the auxiliary table.
+```text
+collect → dry-run → explicit human approval → delete → verify
+```
 
-The command-line script supports these actions directly. For Kubernetes, the
-repository supplies a one-shot Job runner that separates collection, review,
-and deletion.
+Read the [Kubernetes Job runner](deploy/kubernetes/README.md) before you run a
+cleanup. It is the authoritative production procedure.
 
-## Safety
+## Safety boundary
 
-Deleting an object is irreversible. Always run and review a dry-run before
-deletion, and scope the configured bucket and prefix as narrowly as possible.
+Deleting an object is irreversible. `s3gc` preserves the following controls:
 
-- Use a unique collection-table prefix for each cleanup.
-- For clustered ClickHouse, use the cluster name and expected replica count.
-- A failed delete Job does not automatically retry. Successfully deleted
-  batches remain checkpointed, so a replacement delete Job can resume safely.
-- Never put credentials, customer manifests, or target-cluster details in Git.
+- A delete Job needs the `DELETE_ORPHANS` confirmation token.
+- A clustered delete checks the configured cluster and expected replica count
+  before it calls S3.
+- A failed delete Job does not retry automatically. Confirmed batches remain
+  checkpointed, so a replacement Job can resume with the same collection-table
+  prefix.
+- `USEAGE` must be at least 24 hours outside development automation. This age
+  window protects a part that S3 has received before ClickHouse registers it.
+- The Kubernetes renderer requires a digest-pinned image and keeps credentials
+  outside the manifest.
 
-## Requirements
+Use a unique collection-table prefix for each bucket and prefix. Never commit
+credentials, rendered manifests, target-cluster details, or run output.
 
-- Python 3.11 for local development; the container image also uses Python 3.11.
-- Network access to ClickHouse and the target S3-compatible endpoint.
-- A ClickHouse user that can read `system.remote_data_paths` and manage the
-  auxiliary table.
-- S3 permissions appropriate to the action: list for collection, plus delete
-  for deletion.
+## Local setup and read-only preview
 
-## Quick start
-
-Create a local environment and inspect the available options:
+Install the pinned dependencies and inspect the available options:
 
 ```bash
 python3.11 -m venv .venv
@@ -48,30 +42,100 @@ python3.11 -m venv .venv
 .venv/bin/python s3gc.py --help
 ```
 
-Configuration can be supplied as command-line arguments or `S3GC_*`
-environment variables. Set the ClickHouse connection, S3 endpoint/bucket/prefix,
-region, disk name, and either static S3 keys or workload identity. Keep secrets
-in your approved secret manager or environment, not in command history.
+Set configuration with flags or `S3GC_*` environment variables. A minimum
+non-secret setup looks like this:
 
-Run a dry-run first:
+```bash
+export S3GC_CHHOST='<per-replica-clickhouse-host>'
+export S3GC_CHPORT=8123
+export S3GC_CHUSER='<clickhouse-user>'
+export S3GC_S3IP='s3.eu-central-1.amazonaws.com'
+export S3GC_S3PORT=443
+export S3GC_S3BUCKET='<bucket>'
+export S3GC_S3PATH='<target-prefix>/'
+export S3GC_S3REGION='eu-central-1'
+export S3GC_S3SECURE_FLAG=true
+export S3GC_S3DISKNAME=s3
+export S3GC_CLUSTERNAME='<clickhouse-cluster>'
+export S3GC_EXPECTED_REPLICAS=2
+export S3GC_COLLECTTABLEPREFIX='s3gc_example_'
+export S3GC_USEAGE=24
+```
+
+Inject passwords and keys from a secret manager or your shell. Do not save them
+in a file or command history. Then run a preview:
 
 ```bash
 .venv/bin/python s3gc.py --verbose --dry-run
 ```
 
-For a production or customer cleanup, use the Kubernetes procedure below rather
-than a one-line delete command.
+Use direct deletion only for controlled development work. The Kubernetes
+runbook separates collection, review, approval, deletion, and verification.
+
+## Authentication and object stores
+
+Choose one S3 authentication mode with `S3GC_S3AUTH`:
+
+| Mode | Credentials | Use it for |
+| --- | --- | --- |
+| `static` | `S3GC_S3ACCESSKEY` and `S3GC_S3SECRETKEY`; optional session token | explicit credentials from a secret manager |
+| `aws` | boto3 chain; optional `S3GC_S3PROFILE` | AWS SSO or a named workstation profile |
+| `iam` | MinIO workload-identity provider | EKS IRSA, EC2 instance profiles, or ECS task roles |
+
+`S3GC_S3PROFILE` selects `aws`; the tool rejects contradictory settings. An
+`aws` preview still needs `s3:ListBucket` for the configured bucket and prefix.
+
+GCS uses HMAC interoperability keys and usually names the object disk `gcs`.
+It does not support S3 batch deletion, so `s3gc` falls back to slower
+per-object deletion. Set `S3GC_S3DISKNAME=gcs`; do not use a `*_cache` disk as
+the reference scope.
+
+## Kubernetes deployment
+
+The Kubernetes runner is in [deploy/kubernetes](deploy/kubernetes/). It uses a
+one-shot Job, a non-secret environment file, and a Kubernetes Secret or
+workload identity for credentials.
+
+Start with these links:
+
+1. [Run the production workflow](deploy/kubernetes/README.md#runbook)
+2. [Configure the Job](deploy/kubernetes/README.md#configuration-reference)
+3. [Copy the non-secret example](deploy/kubernetes/example.env)
+
+Released images are public at `ghcr.io/altinity/s3gc`. Always use a digest:
+
+```bash
+docker pull ghcr.io/altinity/s3gc@sha256:<digest>
+```
+
+CI publishes the exact `IMAGE=` value in its job summary. The renderer rejects
+mutable image tags.
+
+## Durable run history
+
+By default, each run writes structured events to
+`<COLLECTTABLEPREFIX><S3DISKNAME>_log` in ClickHouse. The table records phase
+starts, collect progress, deletion checkpoints, totals, warnings, and errors.
+It outlives the Job and rotated pod logs.
+
+Query one run on the same replica-pinned ClickHouse host:
+
+```sql
+SELECT event_time, phase, event, objects, bytes, message
+FROM   <db>.<prefix><disk>_log
+WHERE  run_id = '<job-name>'
+ORDER BY event_time;
+```
+
+Set `RUNLOG=false` only when stdout is an adequate record. A run-log failure
+falls back to stdout and does not stop a cleanup.
 
 ## AI-agent skill
 
-This repository includes a reusable operational skill at
-[`skills/altinity-clickhouse-s3gc`](skills/altinity-clickhouse-s3gc/). It guides
-agents through the same guarded production workflow documented here, including
-per-replica ClickHouse routing, reviewed dry-run results, explicit human delete
-approval, and final verification.
-
-Install it by symlinking or copying the directory into your agent's skills
-directory. For example, for Codex:
+[`skills/altinity-clickhouse-s3gc`](skills/altinity-clickhouse-s3gc/) gives an
+agent the same safety boundaries as the Kubernetes runbook. Install it by
+symlinking or copying the directory into the agent's skills directory. For
+Codex:
 
 ```bash
 mkdir -p ~/.codex/skills
@@ -79,294 +143,41 @@ ln -s /path/to/s3gc/skills/altinity-clickhouse-s3gc \
       ~/.codex/skills/altinity-clickhouse-s3gc
 ```
 
-For Claude Code, substitute `~/.claude/skills`. Invoke it with
-`$altinity-clickhouse-s3gc` or ask the agent to plan a reviewed `s3gc` cleanup.
-The skill does not permit an agent to supply the deletion confirmation; an
-authorized human must approve the reviewed dry-run result.
+The skill never supplies the delete confirmation. An authorized human must
+approve the reviewed dry-run result.
 
 ## AI coding workflow
 
-This repo uses `CLAUDE.md` (full guide) and `AGENTS.md` (short pointer) to
-tell AI coding agents how to work here. If you ask an agent to fix a bug or
-add a feature, here's what it does:
+`CLAUDE.md` (full guide) and `AGENTS.md` (short pointer) tell AI coding
+agents how to work here. For a new feature, bug fix, or behaviour change:
 
-1. **Spec Intake** — if you didn't give enough detail, the agent asks a few
-   short questions: what's happening vs. what should happen, how to trigger
-   it, whether it touches the delete lifecycle, and any known edge cases.
-2. **Spec** — the agent writes a short spec (problem + acceptance criteria)
-   in the commit that starts the change.
-3. **TDD** — for each acceptance criterion, the agent writes a failing test,
-   then makes it pass.
+1. **Spec Intake** — if the request is underspecified, the agent asks what
+   should happen instead, how to trigger it, whether it touches the delete
+   lifecycle, and known edge cases.
+2. **Spec** — a short problem statement and acceptance criteria, in the
+   commit that starts the change.
+3. **TDD** — a failing test per acceptance criterion, then made to pass.
 
-This applies to new features, bug fixes, and behaviour changes. Editorial
-changes (docs, comments) skip it. See `CLAUDE.md` for the full rules.
+Editorial changes (docs, comments) skip this. See `CLAUDE.md` for the full
+rules.
 
-## Direct script examples
+## Development checks
 
-The following is a non-secret target configuration. Replace every
-`<placeholder>` value and do not commit this environment to Git:
+Run offline tests:
 
 ```bash
-export S3GC_CHHOST='<clickhouse-host>'
-export S3GC_CHPORT=8123
-export S3GC_CHUSER='<clickhouse-user>'
-export S3GC_S3IP='s3.eu-central-1.amazonaws.com'
-export S3GC_S3PORT=443
-export S3GC_S3BUCKET='<bucket>'
-export S3GC_S3PATH='<only-the-target-prefix>/'
-export S3GC_S3REGION='eu-central-1'
-export S3GC_S3SECURE_FLAG=true
-export S3GC_S3DISKNAME=s3
-export S3GC_CLUSTERNAME='<clickhouse-cluster>'
-export S3GC_EXPECTED_REPLICAS=2
-export S3GC_COLLECTTABLEPREFIX='s3gc_example_'
-export S3GC_AGE=24
-export S3GC_USEAGE=24   # minimum 24; raising is fine, lowering is refused
+.venv/bin/python -m pytest -v -m "not dev_cluster"
 ```
 
-### S3 authentication modes
-
-Select one with `S3GC_S3AUTH` (or `--s3auth`):
-
-| Mode | Credentials | Needs boto3 | Typical use |
-|---|---|---|---|
-| `static` (default) | `S3GC_S3ACCESSKEY` + `S3GC_S3SECRETKEY`, optionally `S3GC_S3SESSIONTOKEN` | no | long-lived keys, or explicit temporary credentials |
-| `aws` | boto3 credential chain, optionally `S3GC_S3PROFILE` | **yes** | AWS SSO / named profiles on a workstation |
-| `iam` | MinIO workload identity provider | no | EKS IRSA, EC2 instance profile, ECS task role |
-
-`S3GC_S3PROFILE` implies `aws`. Contradictory combinations are rejected rather
-than silently resolved.
-
-#### Static credentials
-
-Inject static credentials from a secret manager or interactive shell rather
-than saving them in a file:
+Render and validate the example Job without contacting a cluster:
 
 ```bash
-export S3GC_CHPASS='<clickhouse-password>'
-export S3GC_S3ACCESSKEY='<s3-access-key>'
-export S3GC_S3SECRETKEY='<s3-secret-key>'
-```
-
-Every `S3GC_*` boolean accepts `true/false`, `yes/no`, `on/off`, `1/0`, or an
-empty value for false. Unset also means false.
-
-#### AWS SSO or a named profile
-
-Authenticate with the AWS CLI first, then let `s3gc` resolve temporary
-credentials through the boto3 chain:
-
-```bash
-aws sso login --profile my-sso-profile
-
-export S3GC_S3AUTH=aws
-export S3GC_S3PROFILE=my-sso-profile
-export S3GC_S3IP=s3.amazonaws.com
-export S3GC_S3PORT=443
-export S3GC_S3REGION=us-east-1
-export S3GC_S3SECURE_FLAG=true
-.venv/bin/python ./s3gc.py --verbose --dry-run
-```
-
-`S3GC_S3ACCESSKEY` and `S3GC_S3SECRETKEY` are unused in `aws` mode, and setting
-them is an error rather than a silent override. The resolved credentials must
-allow `s3:ListBucket` on the bucket for that prefix **even for `--dry-run`** —
-collection lists objects. On failure `s3gc` prints the required permission and
-the commands to verify it:
-
-```bash
-aws sts get-caller-identity --profile my-sso-profile
-aws s3api list-objects-v2 --bucket <bucket> --prefix <prefix> --max-keys 1 --profile my-sso-profile
-```
-
-#### Workload identity (EKS/IRSA, EC2, ECS)
-
-```bash
-export S3GC_CHPASS='<clickhouse-password>'
-export S3GC_S3AUTH=iam
-```
-
-`iam` uses MinIO's AWS IAM credential provider and refreshes temporary
-credentials from EKS IRSA/workload identity, an EC2 instance profile, or an ECS
-task role. Prefer it over `aws` inside Kubernetes: it keeps `boto3` out of the
-request path and avoids credentials expiring during a long collect or delete.
-
-It does not read AWS CLI profiles, `aws sso login` state, `~/.aws/config`, or
-`AWS_PROFILE`; use `aws` mode for that workstation workflow.
-
-#### GCS and other stores without batch delete
-
-GCS has no batch `DeleteObjects`. `s3gc` detects a `storage.googleapis.com`
-endpoint and falls back to per-object deletion automatically, warning that it is
-slower; `--use-remove-objects=false` sets it explicitly. Note the disk name is
-usually `gcs`, not `s3`, and GCS needs **HMAC/interop** keys:
-
-```bash
-export S3GC_S3ACCESSKEY='GOOG1...'
-export S3GC_S3SECRETKEY='...'
-export S3GC_S3IP=storage.googleapis.com
-export S3GC_S3PORT=443
-export S3GC_S3SECURE_FLAG=true
-export S3GC_S3DISKNAME=gcs
-.venv/bin/python ./s3gc.py --verbose --use-remove-objects=false
-```
-
-### Safe split workflow
-
-Collection makes an auxiliary table; the second command reads it and reports
-candidates without deleting objects:
-
-```bash
-.venv/bin/python s3gc.py --collectonly --keepdata
-.venv/bin/python s3gc.py --usecollected --dry-run
-```
-
-### Collect has no resume — shard large buckets
-
-A crashed or interrupted `--collectonly` restarts its listing from the
-beginning; there is no checkpoint. On a multi-million-object bucket that can
-cost hours, and long runs are exactly where a rotating password or a dropped
-connection tends to strike.
-
-Shard the listing by prefix and re-run only the shards that failed. This is safe
-to repeat: the auxiliary table is a `ReplacingMergeTree` keyed on `objpath`, so
-re-listing a shard is idempotent.
-
-```bash
-# buckets laid out as <prefix>/<3-char hash>/<blob>
-for shard in 0 1 2 3 4 5 6 7 8 9 a b c d e f g h i j k l m n o p q r s t u v w x y z; do
-  S3GC_S3PATH="<prefix>/${shard}" ./s3gc.py --collectonly --keepdata || \
-    echo "shard ${shard} FAILED — re-run just this one"
-done
-```
-
-The same variables can be passed as flags (for example,
-`--ch-host` or `--s3-bucket`). Run `.venv/bin/python s3gc.py --help` for the
-complete flag and environment-variable reference. Avoid direct deletion for
-customer or production work; use the reviewed Kubernetes workflow instead.
-
-## Container image
-
-Released images are **public** at `ghcr.io/altinity/s3gc`, so Kubernetes needs no
-`imagePullSecret`. Always reference them **by digest**, never by tag — tags get
-re-pushed and stop reproducing what you tested:
-
-```bash
-docker pull ghcr.io/altinity/s3gc@sha256:<digest>
-```
-
-CI prints the exact `IMAGE=` line in its job summary; paste that into your
-`.env`. `render.py` refuses anything not digest-pinned.
-
-Build locally for a quick check:
-
-```bash
-docker build -f docker/Dockerfile -t s3gc:local .
-```
-
-To publish by hand, **both architectures are mandatory** — ClickHouse node pools
-are frequently arm64, and an amd64-only image will not schedule there:
-
-```bash
-docker buildx build --platform linux/amd64,linux/arm64 \
-  -f docker/Dockerfile -t ghcr.io/altinity/s3gc:<tag> --push .
-docker buildx imagetools inspect ghcr.io/altinity/s3gc:<tag>   # expect amd64 AND arm64
-```
-
-> Buildx builder containers cache `/etc/resolv.conf` at creation time. A builder
-> left running across a network or VPN change fails with
-> `lookup registry-1.docker.io: i/o timeout` while the host resolves fine.
-> Recreate the builder, or create one with `--driver-opt network=host`.
-
-The CI workflow runs tests on every pull request and publishes from pushes to
-`master` and version tags, authenticating to GHCR with the automatic
-`GITHUB_TOKEN`.
-
-## Kubernetes
-
-The Kubernetes runner lives in [`deploy/kubernetes/`](deploy/kubernetes/). It
-uses a digest-pinned image and external Kubernetes Secrets; it does not create
-or store credentials in the repository.
-
-For customer and production work, follow:
-
-```text
-collect → dry-run → approved delete → verify
-```
-
-The concise operator procedure, Secret requirements, and renderer configuration
-are in [deploy/kubernetes/README.md](deploy/kubernetes/README.md). A guarded
-`dev-automation` phase is available only for non-production testing; it runs
-collect, dry-run, and delete in one Job and still requires an explicit delete
-confirmation.
-
-## Durable run history
-
-Each run appends structured events to `<collecttableprefix><disk>_log` in
-ClickHouse, beside the auxiliary table: phase start, collect progress,
-per-sample start, one row per confirmed delete batch, and a closing total, each
-carrying the scope the run was pointed at. The table is never truncated.
-
-This exists because pod logs are ephemeral — the kubelet rotates them and a
-deleted Job takes them with it — so a completed cleanup would otherwise leave no
-evidence of what it removed. ClickHouse is the sink because the connection and
-grants already exist; writing the log into the bucket would make the *next*
-collect see it as an orphan and delete it.
-
-```sql
-SELECT event_time, phase, event, objects, bytes, message
-FROM   <collecttableprefix><disk>_log
-WHERE  run_id = '<run-id>'
-ORDER BY event_time;
-```
-
-`--runid` labels the run (Kubernetes Jobs use the Job name automatically);
-`--runlog false` turns the table off. It needs the same `CREATE TABLE` grant as
-the auxiliary table, and a missing grant degrades to stdout only rather than
-failing the run.
-
-## Testing
-
-Run all isolated unit tests:
-
-```bash
-.venv/bin/python -m pytest -v
-```
-
-Run only the development-automation tests:
-
-```bash
-.venv/bin/python -m pytest -v -k dev_automation
-```
-
-Validate that the example Kubernetes configuration renders without creating a
-cluster resource:
-
-```bash
-python3 deploy/kubernetes/render.py deploy/kubernetes/example.env > /tmp/s3gc-job.yaml
+.venv/bin/python deploy/kubernetes/render.py deploy/kubernetes/example.env > /tmp/s3gc-job.yaml
 docker run --rm --entrypoint /kubeconform -v /tmp:/tmp:ro \
   ghcr.io/yannh/kubeconform@sha256:85dbef6b4b312b99133decc9c6fc9495e9fc5f92293d4ff3b7e1b30f5611823c \
   -strict -summary /tmp/s3gc-job.yaml
 ```
 
-The unit suite does not contact ClickHouse, S3, or Kubernetes. The reserved
-`dev_cluster` pytest marker is excluded from CI; any future tests using it must
-be selected explicitly with `.venv/bin/python -m pytest -m dev_cluster` after
-reviewing their fixture scope. The collect/dry-run/delete exercise is manual
-because it can intentionally delete development objects.
-
-## Repository layout
-
-- `s3gc.py` — collection, anti-join, and deletion logic.
-- `docker/` — Python 3.11 container image and Kubernetes entrypoint.
-- `deploy/kubernetes/` — plain Job template, renderer, example configuration,
-  and operator guide.
-- `tests/` — pytest safety, renderer, and entrypoint tests.
-
-## History and roadmap
-
-See [`CHANGELOG.md`](CHANGELOG.md) for the full history, including why each
-change was made and the evidence behind defects found in production use.
-
-Planned: concurrency and asynchronous collection/deletion; a `--collectafter`
-checkpoint so an interrupted collect can resume instead of re-listing.
+See [CLAUDE.md](CLAUDE.md) for contributor requirements,
+[CHANGELOG.md](CHANGELOG.md) for operational history, and [TODO.md](TODO.md)
+for deferred work.

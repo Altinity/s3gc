@@ -15,7 +15,13 @@ expose.
 
 ## [Unreleased]
 
-Nothing yet.
+### Documentation
+
+- Reworked the Kubernetes guidance into a phase-based production runbook and a
+  compact configuration reference. It now states the workload-identity
+  contract while preserving the Job's least-privilege ServiceAccount-token
+  setting, and the packaged agent skill uses the same approval and age-window
+  safeguards.
 
 ## [0.7.0] - 2026-08-24
 

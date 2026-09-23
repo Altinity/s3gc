@@ -146,6 +146,21 @@ ln -s /path/to/s3gc/skills/altinity-clickhouse-s3gc \
 The skill never supplies the delete confirmation. An authorized human must
 approve the reviewed dry-run result.
 
+## AI coding workflow
+
+`CLAUDE.md` (full guide) and `AGENTS.md` (short pointer) tell AI coding
+agents how to work here. For a new feature, bug fix, or behaviour change:
+
+1. **Spec Intake** — if the request is underspecified, the agent asks what
+   should happen instead, how to trigger it, whether it touches the delete
+   lifecycle, and known edge cases.
+2. **Spec** — a short problem statement and acceptance criteria, in the
+   commit that starts the change.
+3. **TDD** — a failing test per acceptance criterion, then made to pass.
+
+Editorial changes (docs, comments) skip this. See `CLAUDE.md` for the full
+rules.
+
 ## Development checks
 
 Run offline tests:

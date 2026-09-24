@@ -23,6 +23,13 @@ expose.
   setting, and the packaged agent skill uses the same approval and age-window
   safeguards.
 
+- Expanded the Kubernetes prerequisites into a copy-paste-ready ClickHouse
+  database/user/grant sequence and a static-credential Secret creation
+  sequence. The runbook now requires a database-qualified collection-table
+  prefix, so an auxiliary table cannot silently resolve in an unexpected
+  ClickHouse user default database. It also calls out the `REMOTE` grant for
+  clustered preflight and the S3 IAM permissions needed by collect and delete.
+
 ## [0.7.0] - 2026-08-24
 
 A safety release, and its headline is uncomfortable: the dangerous

@@ -50,7 +50,7 @@ Set the values in `s3gc.env`, then check these five items before rendering:
 1. Set `CHHOST` to one per-replica ClickHouse Service and use the same host for every phase. The inventory table is node-local; a load-balanced Service can send a later phase to a replica without that table.
 2. Set the exact bucket, prefix, and underlying object-disk name. `S3PATH` may be empty. GCS commonly uses `gcs`; never use a `*_cache` disk.
 3. Set the actual `CLUSTERNAME` and `EXPECTED_REPLICAS` for clustered cleanup. Delete fails closed if this preflight does not match.
-4. Choose a unique `COLLECTTABLEPREFIX`. Keep it after a partial delete so the replacement Job can use the deletion checkpoints.
+4. Choose a unique, database-qualified `COLLECTTABLEPREFIX`, such as `s3gc.s3gc_<run>_`. Keep it after a partial delete so the replacement Job can use the deletion checkpoints. A bare prefix uses the ClickHouse user's current database, which can differ from `default` and cause a grant failure.
 5. Set `USEAGE_HOURS` to 24 or more. Raise it for slow merges or long mutations; production phases cannot lower it.
 
 Use an immutable multi-architecture image digest in `IMAGE`. CI prints the
@@ -77,14 +77,64 @@ API. For `iam`, the platform must inject or otherwise provide the workload
 identity credentials. Existing ClickHouse or ClickHouse-backup ServiceAccounts
 are suitable when they meet that cluster policy.
 
-Create or provision a dedicated ClickHouse user with the required grants:
+Create a dedicated auxiliary database and ClickHouse user before the first run.
+Replace `<cluster-name>`, `<auxiliary-database>`, and the password placeholder.
+Use the same `<auxiliary-database>.` prefix in `COLLECTTABLEPREFIX`.
 
 ```sql
-GRANT SELECT ON system.*                     TO s3gc;
-GRANT SELECT, INSERT, CREATE TABLE ON <db>.* TO s3gc;
+CREATE DATABASE IF NOT EXISTS <auxiliary-database>
+ON CLUSTER <cluster-name>;
+
+CREATE USER IF NOT EXISTS s3gc
+ON CLUSTER <cluster-name>
+IDENTIFIED WITH sha256_password BY '<strong-password>';
+
+GRANT ON CLUSTER <cluster-name>
+    SELECT ON system.* TO s3gc;
+
+GRANT ON CLUSTER <cluster-name>
+    SELECT, INSERT, CREATE TABLE ON <auxiliary-database>.* TO s3gc;
+
+GRANT ON CLUSTER <cluster-name>
+    REMOTE ON *.* TO s3gc;
 ```
 
-The second grant covers the auxiliary inventory and durable run-log tables.
+The database grant covers the auxiliary inventory and durable run-log tables.
+`REMOTE` permits the `clusterAllReplicas` reads used by clustered dry-run and
+delete preflight. Do not grant ClickHouse's `S3` source privilege: s3gc uses
+its own S3 client and the Secret or workload identity instead.
+
+For `S3AUTH=static`, create the Secret from a private, shell-style credential
+file. Keep this file outside the repository, restrict it to its owner, and
+never print or commit it. Its values must be exported as follows:
+
+```bash
+export S3GC_CHUSER=s3gc
+export S3GC_CHPASS='<ClickHouse password>'
+export S3GC_S3ACCESSKEY='<S3 access key>'
+export S3GC_S3SECRETKEY='<S3 secret key>'
+```
+
+Create the Secret. This command creates it once and refuses to overwrite an
+existing Secret:
+
+```bash
+set -a
+. /private/path/s3gc-secrets.env
+set +a
+
+kubectl -n <namespace> create secret generic <credentials-secret-name> \
+  --from-literal=S3GC_CHUSER="$S3GC_CHUSER" \
+  --from-literal=S3GC_CHPASS="$S3GC_CHPASS" \
+  --from-literal=S3GC_S3ACCESSKEY="$S3GC_S3ACCESSKEY" \
+  --from-literal=S3GC_S3SECRETKEY="$S3GC_S3SECRETKEY"
+
+unset S3GC_CHUSER S3GC_CHPASS S3GC_S3ACCESSKEY S3GC_S3SECRETKEY
+```
+
+The S3 principal needs `s3:ListBucket` on the scoped bucket/prefix for
+collection. A delete Job additionally needs `s3:DeleteObject` on the scoped
+object keys. Keep delete permission separate until an approved delete phase.
 
 ### 4. Run each phase
 

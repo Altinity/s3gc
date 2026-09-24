@@ -30,6 +30,17 @@ expose.
   ClickHouse user default database. It also calls out the `REMOTE` grant for
   clustered preflight and the S3 IAM permissions needed by collect and delete.
 
+- Documented the collection scope for an installation-wide cleanup. An object
+  layout with a `<installation>/<replica>/` level tempted an operator to
+  collect one replica's prefix, which misses the other replicas' orphans. The
+  guides now say to collect the parent prefix into one inventory table and
+  rely on the clustered comparison against every replica's
+  `system.remote_data_paths`.
+
+- Documented that static mode does not read the standard `AWS_ACCESS_KEY_ID`
+  and `AWS_SECRET_ACCESS_KEY` variables, with a mapping to the `S3GC_*`
+  Secret keys. Operators expected the AWS names to work.
+
 ## [0.7.0] - 2026-08-24
 
 A safety release, and its headline is uncomfortable: the dangerous

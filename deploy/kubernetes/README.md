@@ -53,6 +53,15 @@ Set the values in `s3gc.env`, then check these five items before rendering:
 4. Choose a unique, database-qualified `COLLECTTABLEPREFIX`, such as `s3gc.s3gc_<run>_`. Keep it after a partial delete so the replacement Job can use the deletion checkpoints. A bare prefix uses the ClickHouse user's current database, which can differ from `default` and cause a grant failure.
 5. Set `USEAGE_HOURS` to 24 or more. Raise it for slow merges or long mutations; production phases cannot lower it.
 
+For an installation-wide cleanup, set `S3PATH` to the parent prefix that
+contains every replica's objects, such as `clickhouse/<installation>/`, not a
+single `<installation>/<replica>/` prefix. Collect it once into one inventory
+table on the pinned host. With `CLUSTERNAME` set, dry-run and delete compare
+the inventory with `system.remote_data_paths` on all replicas, so an object
+that any replica still references is never a candidate. A single-replica
+prefix misses the other replicas' orphans. Collect per-replica prefixes only
+when you intend to, and give each one its own `COLLECTTABLEPREFIX`.
+
 Use an immutable multi-architecture image digest in `IMAGE`. CI prints the
 exact value after publishing. Do not use an image tag.
 
@@ -106,7 +115,17 @@ its own S3 client and the Secret or workload identity instead.
 
 For `S3AUTH=static`, create the Secret from a private, shell-style credential
 file. Keep this file outside the repository, restrict it to its owner, and
-never print or commit it. Its values must be exported as follows:
+never print or commit it. s3gc does not read `AWS_ACCESS_KEY_ID` or
+`AWS_SECRET_ACCESS_KEY` in static mode. Store those values under the s3gc
+names instead:
+
+| AWS variable | Secret key |
+| --- | --- |
+| `AWS_ACCESS_KEY_ID` | `S3GC_S3ACCESSKEY` |
+| `AWS_SECRET_ACCESS_KEY` | `S3GC_S3SECRETKEY` |
+| `AWS_SESSION_TOKEN` | `S3GC_S3SESSIONTOKEN` (optional) |
+
+The file must export these values:
 
 ```bash
 export S3GC_CHUSER=s3gc

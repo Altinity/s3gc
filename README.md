@@ -65,6 +65,7 @@ export S3GC_S3SECURE_FLAG=true
 export S3GC_S3DISKNAME=s3
 export S3GC_CLUSTERNAME='<clickhouse-cluster>'
 export S3GC_EXPECTED_REPLICAS=2
+export S3GC_COLLECTDATABASE='s3gc'
 export S3GC_COLLECTTABLEPREFIX='s3gc_example_'
 export S3GC_USEAGE=24
 ```

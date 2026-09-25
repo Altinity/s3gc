@@ -1701,6 +1701,136 @@ def test_dry_run_does_not_require_a_cluster_preflight(
     s3gc_module["do_use"]()
 
 
+# ---------------------------------------------------------------------------
+# Regression tests: explicit --collectdatabase (Magellan HANDOFF.md item #1).
+#
+# A production collect Job failed safely when an unqualified
+# COLLECTTABLEPREFIX created its auxiliary table in the ClickHouse user's
+# current database instead of the intended one. Database qualification was
+# implicit in a single dotted string and easy to omit.
+# ---------------------------------------------------------------------------
+
+
+def test_collectdatabase_qualifies_an_unqualified_prefix(monkeypatch):
+    """--collectdatabase must work without embedding a dot in the prefix."""
+    module = _load_with_env(
+        monkeypatch,
+        S3GC_COLLECTDATABASE="aux_db",
+        S3GC_COLLECTTABLEPREFIX="s3gc_run_",
+    )
+    assert module["dbname"] == "`aux_db`"
+    assert module["tname"] == "`aux_db`.`s3gc_run_s3`"
+    assert module["log_tname"] == "`aux_db`.`s3gc_run_s3_log`"
+
+
+def test_collectdatabase_matching_embedded_database_is_accepted(monkeypatch):
+    """The same database given both ways is not a conflict."""
+    module = _load_with_env(
+        monkeypatch,
+        S3GC_COLLECTDATABASE="aux_db",
+        S3GC_COLLECTTABLEPREFIX="aux_db.s3gc_run_",
+    )
+    assert module["tname"] == "`aux_db`.`s3gc_run_s3`"
+
+
+def test_collectdatabase_conflicting_with_embedded_database_is_rejected(monkeypatch):
+    """A mismatched pair must fail closed rather than silently pick one."""
+    with pytest.raises(ValueError, match="conflicts"):
+        _load_with_env(
+            monkeypatch,
+            S3GC_COLLECTDATABASE="aux_db",
+            S3GC_COLLECTTABLEPREFIX="other_db.s3gc_run_",
+        )
+
+
+def test_embedded_database_alone_still_works(monkeypatch):
+    """Existing deployments that only dot-qualify the prefix are unaffected."""
+    module = _load_with_env(
+        monkeypatch, S3GC_COLLECTTABLEPREFIX="aux_db.s3gc_run_"
+    )
+    assert module["dbname"] == "`aux_db`"
+    assert module["tname"] == "`aux_db`.`s3gc_run_s3`"
+
+
+def test_unqualified_prefix_without_collectdatabase_still_works(monkeypatch):
+    """No database anywhere keeps using the ClickHouse session's current one."""
+    module = _load_with_env(
+        monkeypatch, S3GC_COLLECTTABLEPREFIX="s3gc_run_"
+    )
+    assert module["dbname"] is None
+    assert module["tname"] == "`s3gc_run_s3`"
+
+
+def test_renderer_omits_unset_collectdatabase(tmp_path):
+    """COLLECTDATABASE is optional: an env file without it must keep rendering."""
+    source = (ROOT / "deploy/kubernetes/example.env").read_text()
+    without = "\n".join(
+        line for line in source.splitlines() if not line.startswith("COLLECTDATABASE=")
+    )
+    config_path = tmp_path / "legacy.env"
+    config_path.write_text(without)
+
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "deploy/kubernetes/render.py"), config_path],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "S3GC_COLLECTDATABASE" not in result.stdout
+
+
+def test_renderer_keeps_configured_collectdatabase(tmp_path):
+    """An explicit auxiliary database must reach the container."""
+    source = (ROOT / "deploy/kubernetes/example.env").read_text()
+    config_path = tmp_path / "qualified.env"
+    config_path.write_text(source.replace("COLLECTDATABASE=s3gc", "COLLECTDATABASE=aux_db"))
+
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "deploy/kubernetes/render.py"), config_path],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "S3GC_COLLECTDATABASE" in result.stdout
+    assert '"aux_db"' in result.stdout
+
+
+def test_samples_mismatch_check_uses_the_qualified_database(
+    s3gc_module, args_factory, monkeypatch
+):
+    """The partition-key lookup must use dbname, not always currentDatabase().
+
+    check_samples_match_partitioning() previously always queried
+    `WHERE database = currentDatabase()`, so it silently found nothing and
+    skipped the mismatch warning whenever the auxiliary table lived in a
+    database other than the ClickHouse user's current one.
+    """
+    namespace = s3gc_module["check_samples_match_partitioning"].__globals__
+
+    class RecordingCH:
+        def __init__(self):
+            self.queries = []
+
+        def query(self, query):
+            self.queries.append(query)
+            return QueryResult("CRC32(objpath) % 4")
+
+    client = RecordingCH()
+    monkeypatch.setitem(namespace, "args", args_factory(samples=3))
+    monkeypatch.setitem(namespace, "ch_client", client)
+    monkeypatch.setitem(namespace, "tname", "`aux_db`.`aux`")
+    monkeypatch.setitem(namespace, "dbname", "`aux_db`")
+
+    s3gc_module["check_samples_match_partitioning"]()
+
+    assert "currentDatabase()" not in client.queries[0]
+    assert "database = 'aux_db'" in client.queries[0]
+
+
 def test_image_disables_stdout_buffering():
     """A Job killed at activeDeadlineSeconds used to lose its buffered tail.
 

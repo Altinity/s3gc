@@ -250,6 +250,14 @@ parser.add_argument(
     help="prefix for table name to keep data about objects (database is allowed, if not exists, specify --create-database)",
 )
 parser.add_argument(
+    "--collectdatabase",
+    "--collect-database",
+    dest="collectdatabase",
+    default="",
+    help="database for the auxiliary/run-log tables; must match the database "
+    "embedded in --collecttableprefix if both are given",
+)
+parser.add_argument(
     "--collectbatchsize",
     "--collect-batch-size",
     dest="collectbatchsize",
@@ -669,23 +677,40 @@ logger.debug(f"Parameters: {args}")
 tname = ""
 dbname = None
 
+# The database can be given two ways: embedded in COLLECTTABLEPREFIX as
+# "db.prefix_", or explicitly via COLLECTDATABASE. Embedding it in one string
+# is easy to omit by accident -- that is what let a production collect Job
+# create its auxiliary table in the wrong database. COLLECTDATABASE makes the
+# qualification an explicit, separate setting; a conflicting pair fails fast
+# instead of silently picking one.
 dbparts = args.collecttableprefix.split(".")
 if len(dbparts) > 2:
     raise ValueError("invalid collecttableprefix")
-elif len(dbparts) == 2:
-    dbname = f"`{dbparts[0]}`"
-    tname = f"{dbname}.`{dbparts[1]}{args.s3diskname}`"
+if len(dbparts) == 2:
+    embedded_db, table_prefix = dbparts
+    if args.collectdatabase and args.collectdatabase != embedded_db:
+        raise ValueError(
+            f"--collectdatabase {args.collectdatabase!r} conflicts with the "
+            f"database embedded in --collecttableprefix {embedded_db!r}"
+        )
+    dbname = f"`{embedded_db}`"
 else:
-    tname = f"`{dbparts[0]}{args.s3diskname}`"
+    table_prefix = dbparts[0]
+    dbname = f"`{args.collectdatabase}`" if args.collectdatabase else None
+
+if dbname:
+    tname = f"{dbname}.`{table_prefix}{args.s3diskname}`"
+else:
+    tname = f"`{table_prefix}{args.s3diskname}`"
 
 # The run-log table lives beside the auxiliary table and follows the same naming
 # convention, so one COLLECTTABLEPREFIX still identifies one cleanup. Unlike the
 # auxiliary table it is NEVER truncated: it is the durable record of what the
 # cleanup did after the pod and its logs are gone.
 if dbname:
-    log_tname = f"{dbname}.`{dbparts[1]}{args.s3diskname}_log`"
+    log_tname = f"{dbname}.`{table_prefix}{args.s3diskname}_log`"
 else:
-    log_tname = f"`{dbparts[0]}{args.s3diskname}_log`"
+    log_tname = f"`{table_prefix}{args.s3diskname}_log`"
 
 minio_client = None
 ch_client = None
@@ -1111,7 +1136,6 @@ def do_collect():
     )
 
     if args.createdatabase_flag:
-        parts = args.collecttableprefix.split(".")
         if dbname:
             logger.info(f"creating database {dbname}")
             ch_client.command(f"CREATE DATABASE IF NOT EXISTS {dbname}")
@@ -1199,10 +1223,13 @@ def check_samples_match_partitioning():
     partition pruning: on one production cluster the matching case scanned a
     sample in ~2 min where the mismatching case took ~26 min.
     """
+    database_filter = (
+        f"database = '{dbname.strip('`')}'" if dbname else "database = currentDatabase()"
+    )
     try:
         rows = ch_client.query(
             "SELECT partition_key FROM system.tables "
-            f"WHERE database = currentDatabase() AND name = '{tname.strip('`').split('.')[-1]}'"
+            f"WHERE {database_filter} AND name = '{tname.strip('`').split('.')[-1]}'"
         ).result_rows
     except Exception as exc:
         logger.debug(f"could not read partition_key for {tname}: {exc}")

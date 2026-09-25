@@ -35,11 +35,14 @@ expose.
   collect one replica's prefix, which misses the other replicas' orphans. The
   guides now say to collect the parent prefix into one inventory table and
   rely on the clustered comparison against every replica's
-  `system.remote_data_paths`.
+  `system.remote_data_paths` — but only when that parent prefix holds one
+  `S3DISKNAME`'s objects, since the orphan check matches by disk name and
+  would misclassify another disk's objects under the same prefix as orphaned.
 
 - Documented that static mode does not read the standard `AWS_ACCESS_KEY_ID`
   and `AWS_SECRET_ACCESS_KEY` variables, with a mapping to the `S3GC_*`
-  Secret keys. Operators expected the AWS names to work.
+  Secret keys, including the optional session token in the copy-paste Secret
+  creation commands.
 
 ## [0.7.0] - 2026-08-24
 

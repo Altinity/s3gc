@@ -55,8 +55,14 @@ Set the values in `s3gc.env`, then check these five items before rendering:
 
 For an installation-wide cleanup, set `S3PATH` to the parent prefix that
 contains every replica's objects, such as `clickhouse/<installation>/`, not a
-single `<installation>/<replica>/` prefix. Collect it once into one inventory
-table on the pinned host. With `CLUSTERNAME` set, dry-run and delete compare
+single `<installation>/<replica>/` prefix — but only when that parent prefix
+holds objects for the one `S3DISKNAME` being cleaned up. The orphan check
+matches ClickHouse's `system.remote_data_paths` by `disk_name`, so an object
+that belongs to a different disk stored under the same parent prefix would
+never match and would look orphaned. When disks share a parent prefix, collect
+a disk-scoped prefix instead, or give each disk its own S3 path layout.
+Collect the chosen prefix once into one inventory table on the pinned host.
+With `CLUSTERNAME` set, dry-run and delete compare
 the inventory with `system.remote_data_paths` on all replicas, so an object
 that any replica still references is never a candidate. A single-replica
 prefix misses the other replicas' orphans. Collect per-replica prefixes only
@@ -132,6 +138,7 @@ export S3GC_CHUSER=s3gc
 export S3GC_CHPASS='<ClickHouse password>'
 export S3GC_S3ACCESSKEY='<S3 access key>'
 export S3GC_S3SECRETKEY='<S3 secret key>'
+# export S3GC_S3SESSIONTOKEN='<S3 session token>'  # only for temporary credentials
 ```
 
 Create the Secret. This command creates it once and refuses to overwrite an
@@ -142,13 +149,20 @@ set -a
 . /private/path/s3gc-secrets.env
 set +a
 
-kubectl -n <namespace> create secret generic <credentials-secret-name> \
-  --from-literal=S3GC_CHUSER="$S3GC_CHUSER" \
-  --from-literal=S3GC_CHPASS="$S3GC_CHPASS" \
-  --from-literal=S3GC_S3ACCESSKEY="$S3GC_S3ACCESSKEY" \
+literals=(
+  --from-literal=S3GC_CHUSER="$S3GC_CHUSER"
+  --from-literal=S3GC_CHPASS="$S3GC_CHPASS"
+  --from-literal=S3GC_S3ACCESSKEY="$S3GC_S3ACCESSKEY"
   --from-literal=S3GC_S3SECRETKEY="$S3GC_S3SECRETKEY"
+)
+if [ -n "${S3GC_S3SESSIONTOKEN:-}" ]; then
+  literals+=(--from-literal=S3GC_S3SESSIONTOKEN="$S3GC_S3SESSIONTOKEN")
+fi
 
-unset S3GC_CHUSER S3GC_CHPASS S3GC_S3ACCESSKEY S3GC_S3SECRETKEY
+kubectl -n <namespace> create secret generic <credentials-secret-name> \
+  "${literals[@]}"
+
+unset S3GC_CHUSER S3GC_CHPASS S3GC_S3ACCESSKEY S3GC_S3SECRETKEY S3GC_S3SESSIONTOKEN
 ```
 
 The S3 principal needs `s3:ListBucket` on the scoped bucket/prefix for

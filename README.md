@@ -31,7 +31,10 @@ Deleting an object is irreversible. `s3gc` preserves the following controls:
 
 For an installation-wide cleanup, collect the parent prefix that holds every
 replica's objects and set the cluster name, so the comparison covers all
-replicas. A single-replica prefix misses the other replicas' orphans.
+replicas. A single-replica prefix misses the other replicas' orphans. Only
+collect a parent prefix that holds one `S3DISKNAME`'s objects — the orphan
+check matches by disk name, so another disk's objects under the same prefix
+would look orphaned.
 
 Use a unique collection-table prefix for each bucket and prefix. Never commit
 credentials, rendered manifests, target-cluster details, or run output.

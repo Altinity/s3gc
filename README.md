@@ -29,6 +29,13 @@ Deleting an object is irreversible. `s3gc` preserves the following controls:
 - The Kubernetes renderer requires a digest-pinned image and keeps credentials
   outside the manifest.
 
+For an installation-wide cleanup, collect the parent prefix that holds every
+replica's objects and set the cluster name, so the comparison covers all
+replicas. A single-replica prefix misses the other replicas' orphans. Only
+collect a parent prefix that holds one `S3DISKNAME`'s objects — the orphan
+check matches by disk name, so another disk's objects under the same prefix
+would look orphaned.
+
 Use a unique collection-table prefix for each bucket and prefix. Never commit
 credentials, rendered manifests, target-cluster details, or run output.
 
@@ -81,6 +88,9 @@ Choose one S3 authentication mode with `S3GC_S3AUTH`:
 | `static` | `S3GC_S3ACCESSKEY` and `S3GC_S3SECRETKEY`; optional session token | explicit credentials from a secret manager |
 | `aws` | boto3 chain; optional `S3GC_S3PROFILE` | AWS SSO or a named workstation profile |
 | `iam` | MinIO workload-identity provider | EKS IRSA, EC2 instance profiles, or ECS task roles |
+
+Static mode does not read `AWS_ACCESS_KEY_ID` or `AWS_SECRET_ACCESS_KEY`. Pass
+those values as `S3GC_S3ACCESSKEY` and `S3GC_S3SECRETKEY`.
 
 `S3GC_S3PROFILE` selects `aws`; the tool rejects contradictory settings. An
 `aws` preview still needs `s3:ListBucket` for the configured bucket and prefix.

@@ -1712,3 +1712,139 @@ def test_image_disables_stdout_buffering():
     dockerfile = (ROOT / "docker/Dockerfile").read_text()
 
     assert "ENV PYTHONUNBUFFERED=1" in dockerfile
+
+
+# --- Replicated-database replica preflight -----------------------------------
+#
+# Every DDL in a ClickHouse Replicated database waits for all registered
+# replicas. One dead replica turned the collect phase's first CREATE TABLE into
+# a 180 s wait ending in TIMEOUT_EXCEEDED (159), which the HTTP client surfaced
+# only as IncompleteRead. These pin the up-front check that replaces it.
+
+
+class ReplicaProbeCH:
+    def __init__(self, replicas=(), responding=None, current_database="default", probe_error=None):
+        self.replicas = list(replicas)
+        self.responding = len(self.replicas) if responding is None else responding
+        self.current_database = current_database
+        self.probe_error = probe_error
+        self.queries = []
+
+    def query(self, query):
+        self.queries.append(query)
+        if "currentDatabase()" in query:
+            return QueryResult(self.current_database)
+        if "system.clusters" in query:
+            result = QueryResult(None)
+            result.result_rows = self.replicas
+            return result
+        if "clusterAllReplicas" in query and "system.one" in query:
+            if self.probe_error:
+                raise self.probe_error
+            return QueryResult(self.responding)
+        raise AssertionError(query)
+
+
+TWO_REPLICAS = [("replica-0.example", 9000), ("replica-1.example", 9000)]
+
+
+def _replica_preflight(s3gc_module, monkeypatch, ch, dbname="`gcdb`"):
+    namespace = s3gc_module["preflight_database_replicas"].__globals__
+    monkeypatch.setitem(namespace, "ch_client", ch)
+    monkeypatch.setitem(namespace, "dbname", dbname)
+    return s3gc_module["preflight_database_replicas"]
+
+
+def test_replica_preflight_skips_a_non_replicated_database(s3gc_module, monkeypatch):
+    ch = ReplicaProbeCH(replicas=[])
+    _replica_preflight(s3gc_module, monkeypatch, ch)()
+
+    assert not any("clusterAllReplicas" in query for query in ch.queries)
+
+
+def test_replica_preflight_passes_when_every_replica_responds(s3gc_module, monkeypatch):
+    ch = ReplicaProbeCH(replicas=TWO_REPLICAS, responding=2)
+
+    _replica_preflight(s3gc_module, monkeypatch, ch)()
+
+
+def test_replica_preflight_looks_up_the_auxiliary_tables_database(s3gc_module, monkeypatch):
+    ch = ReplicaProbeCH(replicas=TWO_REPLICAS)
+    _replica_preflight(s3gc_module, monkeypatch, ch, dbname="`gcdb`")()
+
+    assert any("cluster = 'gcdb'" in query for query in ch.queries)
+
+
+def test_replica_preflight_defaults_to_the_current_database(s3gc_module, monkeypatch):
+    ch = ReplicaProbeCH(replicas=TWO_REPLICAS, current_database="userdb")
+    _replica_preflight(s3gc_module, monkeypatch, ch, dbname=None)()
+
+    assert any("cluster = 'userdb'" in query for query in ch.queries)
+
+
+def test_replica_preflight_rejects_an_unresponsive_replica(s3gc_module, monkeypatch):
+    ch = ReplicaProbeCH(replicas=TWO_REPLICAS, responding=1)
+    preflight = _replica_preflight(s3gc_module, monkeypatch, ch)
+
+    with pytest.raises(s3gc_module["UserVisibleError"], match="2 registered replicas but only 1 responded"):
+        preflight()
+
+
+def test_replica_preflight_error_names_every_registered_replica(s3gc_module, monkeypatch):
+    ch = ReplicaProbeCH(replicas=TWO_REPLICAS, responding=1)
+    preflight = _replica_preflight(s3gc_module, monkeypatch, ch)
+
+    with pytest.raises(s3gc_module["UserVisibleError"], match="replica-1.example:9000"):
+        preflight()
+
+
+def test_replica_preflight_reports_a_failed_probe_as_user_visible(s3gc_module, monkeypatch):
+    from clickhouse_connect.driver.exceptions import DatabaseError
+
+    ch = ReplicaProbeCH(replicas=TWO_REPLICAS, probe_error=DatabaseError("ALL_CONNECTION_TRIES_FAILED"))
+    preflight = _replica_preflight(s3gc_module, monkeypatch, ch)
+
+    with pytest.raises(s3gc_module["UserVisibleError"], match="ALL_CONNECTION_TRIES_FAILED"):
+        preflight()
+
+
+def _record_main_steps(s3gc_module, args_factory, monkeypatch, preflight_error=None):
+    namespace = s3gc_module["main"].__globals__
+    steps = []
+
+    def step(name, error=None):
+        def run(*_args, **_kwargs):
+            steps.append(name)
+            if error:
+                raise error
+        return run
+
+    monkeypatch.setitem(
+        namespace,
+        "args",
+        args_factory(usecollected_flag=False, collectonly_flag=True, debug_flag=False, dryrun_flag=False),
+    )
+    monkeypatch.setitem(namespace, "connect_to_ch", step("connect_to_ch"))
+    monkeypatch.setitem(namespace, "preflight_database_replicas", step("preflight_database_replicas", preflight_error))
+    monkeypatch.setitem(namespace, "init_run_log", step("init_run_log"))
+    monkeypatch.setitem(namespace, "connect_to_s3", step("connect_to_s3"))
+    monkeypatch.setitem(namespace, "do_collect", step("do_collect"))
+    monkeypatch.setitem(namespace, "graceful_exit", step("graceful_exit"))
+    return namespace["main"], steps
+
+
+def test_main_checks_database_replicas_before_any_ddl(s3gc_module, args_factory, monkeypatch):
+    main, steps = _record_main_steps(s3gc_module, args_factory, monkeypatch)
+    main()
+
+    assert steps[:3] == ["connect_to_ch", "preflight_database_replicas", "init_run_log"]
+
+
+def test_main_stops_before_any_ddl_when_a_replica_is_down(s3gc_module, args_factory, monkeypatch):
+    error = s3gc_module["UserVisibleError"]("replica down")
+    main, steps = _record_main_steps(s3gc_module, args_factory, monkeypatch, preflight_error=error)
+
+    with pytest.raises(SystemExit) as exit_info:
+        main()
+
+    assert (exit_info.value.code, steps) == (1, ["connect_to_ch", "preflight_database_replicas"])

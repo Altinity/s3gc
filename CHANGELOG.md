@@ -28,7 +28,9 @@ expose.
   the real cause was visible only in `system.query_log`. Each run lost about
   six minutes (the run-log `CREATE`, then the auxiliary-table `CREATE`) before
   crashing with a misleading traceback. `preflight_database_replicas()` now
-  runs right after the ClickHouse connection: it reads the database's
+  runs right after the ClickHouse connection: it confirms in
+  `system.databases` that the database engine is `Replicated` (a configured
+  cluster that merely shares the database's name does not count), reads the
   registered replicas from `system.clusters`, counts the ones that answer
   through `clusterAllReplicas(<db>, system.one)`, and on a shortfall exits 1
   with one message naming the database, both counts and every registered

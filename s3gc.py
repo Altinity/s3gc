@@ -906,11 +906,23 @@ def preflight_database_replicas():
     gets the cause in seconds instead.
     """
     database = dbname.strip("`") if dbname else _query_single_value("SELECT currentDatabase()")
+    # system.clusters also lists configured clusters, so a matching name alone
+    # does not make a database Replicated. Check the engine first.
+    engines = ch_client.query(
+        f"SELECT engine FROM system.databases WHERE name = {quote_sql_string(database)}"
+    ).result_rows
+    if not engines or engines[0][0] != "Replicated":
+        logger.debug(f"database {database} is not Replicated; DDL does not wait on other replicas")
+        return
+
     replicas = ch_client.query(
         f"SELECT host_name, port FROM system.clusters WHERE cluster = {quote_sql_string(database)}"
     ).result_rows
     if not replicas:
-        logger.debug(f"database {database} is not Replicated; DDL does not wait on other replicas")
+        logger.warning(
+            f"Replicated database {database} lists no replicas in system.clusters; "
+            "skipping the database replica preflight"
+        )
         return
 
     try:

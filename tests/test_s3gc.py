@@ -1763,10 +1763,23 @@ def _replica_preflight(s3gc_module, monkeypatch, ch, dbname="`gcdb`"):
 
 
 def test_replica_preflight_skips_a_non_replicated_database(s3gc_module, monkeypatch):
-    ch = ReplicaProbeCH(replicas=[])
+    ch = ReplicaProbeCH(replicas=[], engine="Atomic")
     _replica_preflight(s3gc_module, monkeypatch, ch)()
 
     assert not any("clusterAllReplicas" in query for query in ch.queries)
+
+
+def test_replica_preflight_warns_when_a_replicated_database_lists_no_replicas(
+    s3gc_module, monkeypatch, caplog
+):
+    # Nothing to probe, so the run continues -- but say so, rather than let a
+    # missing system.clusters entry silently disable the check.
+    ch = ReplicaProbeCH(replicas=[], engine="Replicated")
+
+    with caplog.at_level("WARNING"):
+        _replica_preflight(s3gc_module, monkeypatch, ch)()
+
+    assert "lists no replicas" in caplog.text
 
 
 def test_replica_preflight_ignores_a_same_named_cluster_for_an_atomic_database(s3gc_module, monkeypatch):

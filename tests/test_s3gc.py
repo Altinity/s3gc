@@ -1723,7 +1723,10 @@ def test_image_disables_stdout_buffering():
 
 
 class ReplicaProbeCH:
-    def __init__(self, replicas=(), responding=None, current_database="default", probe_error=None):
+    def __init__(
+        self, replicas=(), responding=None, current_database="default", probe_error=None, engine="Replicated"
+    ):
+        self.engine = engine
         self.replicas = list(replicas)
         self.responding = len(self.replicas) if responding is None else responding
         self.current_database = current_database
@@ -1734,6 +1737,10 @@ class ReplicaProbeCH:
         self.queries.append(query)
         if "currentDatabase()" in query:
             return QueryResult(self.current_database)
+        if "system.databases" in query:
+            result = QueryResult(self.engine)
+            result.result_rows = [(self.engine,)] if self.engine else []
+            return result
         if "system.clusters" in query:
             result = QueryResult(None)
             result.result_rows = self.replicas
@@ -1757,6 +1764,15 @@ def _replica_preflight(s3gc_module, monkeypatch, ch, dbname="`gcdb`"):
 
 def test_replica_preflight_skips_a_non_replicated_database(s3gc_module, monkeypatch):
     ch = ReplicaProbeCH(replicas=[])
+    _replica_preflight(s3gc_module, monkeypatch, ch)()
+
+    assert not any("clusterAllReplicas" in query for query in ch.queries)
+
+
+def test_replica_preflight_ignores_a_same_named_cluster_for_an_atomic_database(s3gc_module, monkeypatch):
+    # system.clusters also lists configured clusters. An Atomic database that
+    # shares a cluster's name must not be probed: its DDL is local.
+    ch = ReplicaProbeCH(replicas=TWO_REPLICAS, responding=1, engine="Atomic")
     _replica_preflight(s3gc_module, monkeypatch, ch)()
 
     assert not any("clusterAllReplicas" in query for query in ch.queries)

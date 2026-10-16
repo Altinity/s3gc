@@ -21,6 +21,10 @@ Deleting an object is irreversible. `s3gc` preserves the following controls:
 - A delete Job needs the `DELETE_ORPHANS` confirmation token.
 - A clustered delete checks the configured cluster and expected replica count
   before it calls S3.
+- When the auxiliary database uses `ENGINE = Replicated`, every phase checks
+  that all of its replicas respond before it runs any DDL. A down replica
+  would otherwise stall each `CREATE TABLE` for `distributed_ddl_task_timeout`
+  and surface only as `IncompleteRead`.
 - A failed delete Job does not retry automatically. Confirmed batches remain
   checkpointed, so a replacement Job can resume with the same collection-table
   prefix.

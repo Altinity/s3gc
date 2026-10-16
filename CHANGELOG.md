@@ -15,6 +15,27 @@ expose.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Every phase now checks, before any DDL, that all replicas of a Replicated
+  auxiliary database respond.** Every DDL in a database with
+  `ENGINE = Replicated` waits for all replicas registered in it. With one
+  registered replica down — its pod gone and its hostname no longer resolving —
+  the collect phase's first `CREATE TABLE IF NOT EXISTS` waited
+  `distributed_ddl_task_timeout` (180 s) and failed with `TIMEOUT_EXCEEDED`
+  (159), even though the tables already existed. The server had already sent
+  `200 OK`, so the HTTP client reported only `http.client.IncompleteRead`, and
+  the real cause was visible only in `system.query_log`. Each run lost about
+  six minutes (the run-log `CREATE`, then the auxiliary-table `CREATE`) before
+  crashing with a misleading traceback. `preflight_database_replicas()` now
+  runs right after the ClickHouse connection: it reads the database's
+  registered replicas from `system.clusters`, counts the ones that answer
+  through `clusterAllReplicas(<db>, system.one)`, and on a shortfall exits 1
+  with one message naming the database, both counts and every registered
+  replica. A database that is not Replicated is skipped. Collect itself never
+  needed the other replicas — `INSERT` is not DDL — so the check guards only
+  the DDL the tool issues; the delete-time topology preflight is unchanged.
+
 ### Documentation
 
 - Reworked the Kubernetes guidance into a phase-based production runbook and a

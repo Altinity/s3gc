@@ -34,6 +34,7 @@ import urllib3
 import logging
 import datetime
 import socket
+import time
 import uuid
 
 usage = """
@@ -316,6 +317,13 @@ parser.add_argument(
     dest="expected_replicas",
     type=Optional[int],
     help="Fail before deleting when clusterAllReplicas() does not return this many replicas",
+)
+parser.add_argument(
+    "--replica-liveness-margin-ms",
+    dest="replica_liveness_margin_ms",
+    type=int,
+    default=1000,
+    help="Extra wait beyond the Keeper session timeout before re-checking Replicated-database replica liveness",
 )
 parser.add_argument(
     "--age",
@@ -896,6 +904,24 @@ class UserVisibleError(RuntimeError):
     """An operator-facing failure: reported without a traceback."""
 
 
+def _inactive_database_replicas(database):
+    replicas = ch_client.query(
+        f"SELECT host_name, port, is_active FROM system.clusters WHERE cluster = {quote_sql_string(database)}"
+    ).result_rows
+    return replicas, [f"{host}:{port}" for host, port, is_active in replicas if is_active != 1]
+
+
+def _raise_for_inactive_replicas(database, inactive):
+    if inactive:
+        raise UserVisibleError(
+            f"database replica preflight failed: Replicated database {database!r} has "
+            f"inactive or unknown replicas in Keeper: {', '.join(inactive)}. Every CREATE, "
+            "DROP and TRUNCATE in this database waits for all registered replicas and "
+            "would fail after distributed_ddl_task_timeout. Bring the missing replica back, "
+            "or remove its stale registration from the database, then rerun."
+        )
+
+
 def preflight_database_replicas():
     """Fail fast when a replica of a Replicated database cannot take DDL.
 
@@ -904,6 +930,11 @@ def preflight_database_replicas():
     distributed_ddl_task_timeout and TIMEOUT_EXCEEDED, which the HTTP client
     reported only as IncompleteRead. Checked before any DDL, so the operator
     gets the cause in seconds instead.
+
+    Liveness is system.clusters.is_active, the replica's Keeper session. Not
+    clusterAllReplicas: that logs in to the other replicas as the database's
+    cluster_username (`default` unless configured), which a hardened `default`
+    user rejects even when every replica is healthy.
     """
     database = dbname.strip("`") if dbname else _query_single_value("SELECT currentDatabase()")
     # system.clusters also lists configured clusters, so a matching name alone
@@ -915,39 +946,35 @@ def preflight_database_replicas():
         logger.debug(f"database {database} is not Replicated; DDL does not wait on other replicas")
         return
 
-    replicas = ch_client.query(
-        f"SELECT host_name, port FROM system.clusters WHERE cluster = {quote_sql_string(database)}"
-    ).result_rows
-    if not replicas:
+    try:
+        replicas, inactive = _inactive_database_replicas(database)
+        if not replicas:
+            logger.warning(
+                f"Replicated database {database} lists no replicas in system.clusters; "
+                "skipping the database replica preflight"
+            )
+            return
+        _raise_for_inactive_replicas(database, inactive)
+
+        # A replica that crashed moments ago stays active until Keeper expires
+        # its session, so look again once that can have happened.
+        session_timeout_ms = _query_single_value("SELECT max(session_timeout_ms) FROM system.zookeeper_connection")
+        wait_seconds = (session_timeout_ms + args.replica_liveness_margin_ms) / 1000
+        logger.info(
+            f"database replica preflight: all {len(replicas)} replicas of {database} are active; "
+            f"re-checking in {wait_seconds} s, after the Keeper session timeout"
+        )
+        time.sleep(wait_seconds)
+        replicas, inactive = _inactive_database_replicas(database)
+    except clickhouse_connect.driver.exceptions.ClickHouseError as exc:
         logger.warning(
-            f"Replicated database {database} lists no replicas in system.clusters; "
-            "skipping the database replica preflight"
+            f"cannot read replica liveness of Replicated database {database}; "
+            f"skipping the database replica preflight: {exc}"
         )
         return
+    _raise_for_inactive_replicas(database, inactive)
 
-    try:
-        responding = _query_single_value(
-            f"SELECT count() FROM clusterAllReplicas({quote_sql_string(database)}, system.one) "
-            "SETTINGS skip_unavailable_shards = 1"
-        )
-    except clickhouse_connect.driver.exceptions.ClickHouseError as exc:
-        raise UserVisibleError(
-            f"database replica preflight failed: could not reach the replicas of "
-            f"Replicated database {database!r}: {exc}"
-        ) from exc
-
-    if responding < len(replicas):
-        registered = ", ".join(f"{host}:{port}" for host, port in replicas)
-        raise UserVisibleError(
-            f"database replica preflight failed: Replicated database {database!r} has "
-            f"{len(replicas)} registered replicas but only {responding} responded "
-            f"(registered: {registered}). Every CREATE, DROP and TRUNCATE in this database "
-            "waits for all registered replicas and would fail after "
-            "distributed_ddl_task_timeout. Bring the missing replica back, or remove its "
-            "stale registration from the database, then rerun."
-        )
-
-    logger.info(f"database replica preflight passed: database={database}, replicas={responding}")
+    logger.info(f"database replica preflight passed: database={database}, replicas={len(replicas)}")
 
 
 def connect_to_ch():

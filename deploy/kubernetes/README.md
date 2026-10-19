@@ -117,8 +117,9 @@ GRANT ON CLUSTER <cluster-name>
 The database grant covers the auxiliary inventory and durable run-log tables.
 `REMOTE` permits the `clusterAllReplicas` reads used by clustered dry-run and
 delete preflight. When `<auxiliary-database>` uses `ENGINE = Replicated`, every
-phase, including collect, also uses `REMOTE` to check before any DDL that all of
-that database's replicas respond. Do not grant ClickHouse's `S3` source privilege: s3gc uses
+phase, including collect, first checks that all of that database's replicas are
+active in Keeper and waits one Keeper session timeout (about 30 s) to re-check;
+this reads only system tables and needs no extra grant. Do not grant ClickHouse's `S3` source privilege: s3gc uses
 its own S3 client and the Secret or workload identity instead.
 
 For `S3AUTH=static`, create the Secret from a private, shell-style credential

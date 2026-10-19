@@ -30,11 +30,21 @@ expose.
   crashing with a misleading traceback. `preflight_database_replicas()` now
   runs right after the ClickHouse connection: it confirms in
   `system.databases` that the database engine is `Replicated` (a configured
-  cluster that merely shares the database's name does not count), reads the
-  registered replicas from `system.clusters`, counts the ones that answer
-  through `clusterAllReplicas(<db>, system.one)`, and on a shortfall exits 1
-  with one message naming the database, both counts and every registered
-  replica. A database that is not Replicated is skipped. Collect itself never
+  cluster that merely shares the database's name does not count), then reads
+  each registered replica's `is_active` from `system.clusters`. An inactive
+  or unknown replica exits 1 at once, with one message naming the database
+  and those replicas. Otherwise the check waits the Keeper session timeout
+  from `system.zookeeper_connection` plus `S3GC_REPLICA_LIVENESS_MARGIN_MS`
+  (default 1000 ms) and reads `is_active` again: a replica that crashed just
+  before the run stays active until Keeper expires its session (30 s on the
+  lab after `SIGKILL`). A database that is not Replicated is skipped without
+  waiting; a server that cannot report liveness logs a warning and continues.
+  Liveness deliberately does not come from `clusterAllReplicas(<db>, ...)`:
+  ClickHouse runs that on the other replicas as the database's
+  `cluster_username`, `default` unless configured, not as the s3gc user. A
+  first version did, and on a lab whose `default` user had a password it
+  failed a healthy database with `default: Authentication failed` while the
+  DDL itself, which goes through Keeper, succeeded. Collect itself never
   needed the other replicas — `INSERT` is not DDL — so the check guards only
   the DDL the tool issues; the delete-time topology preflight is unchanged.
 

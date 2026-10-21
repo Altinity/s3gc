@@ -50,7 +50,7 @@ Set the values in `s3gc.env`, then check these five items before rendering:
 1. Set `CHHOST` to one per-replica ClickHouse Service and use the same host for every phase. The inventory table is node-local; a load-balanced Service can send a later phase to a replica without that table.
 2. Set the exact bucket, prefix, and underlying object-disk name. `S3PATH` may be empty. GCS commonly uses `gcs`; never use a `*_cache` disk.
 3. Set the actual `CLUSTERNAME` and `EXPECTED_REPLICAS` for clustered cleanup. Delete fails closed if this preflight does not match.
-4. Choose a unique, database-qualified `COLLECTTABLEPREFIX`, such as `s3gc.s3gc_<run>_`. Keep it after a partial delete so the replacement Job can use the deletion checkpoints. A bare prefix uses the ClickHouse user's current database, which can differ from `default` and cause a grant failure.
+4. Set `COLLECTDATABASE` to the auxiliary database, and choose a unique `COLLECTTABLEPREFIX` such as `s3gc_<run>_`. Keep the prefix after a partial delete so the replacement Job can use the deletion checkpoints. Without `COLLECTDATABASE`, the auxiliary table lands in the ClickHouse user's current database, which can differ from `default` and cause a grant failure; `COLLECTTABLEPREFIX` still accepts an embedded `db.prefix_` form for compatibility, but a value there that disagrees with `COLLECTDATABASE` is rejected at startup.
 5. Set `USEAGE_HOURS` to 24 or more. Raise it for slow merges or long mutations; production phases cannot lower it.
 
 For an installation-wide cleanup, set `S3PATH` to the parent prefix that
@@ -94,7 +94,7 @@ are suitable when they meet that cluster policy.
 
 Create a dedicated auxiliary database and ClickHouse user before the first run.
 Replace `<cluster-name>`, `<auxiliary-database>`, and the password placeholder.
-Use the same `<auxiliary-database>.` prefix in `COLLECTTABLEPREFIX`.
+Set the same `<auxiliary-database>` as `COLLECTDATABASE`.
 
 ```sql
 CREATE DATABASE IF NOT EXISTS <auxiliary-database>
@@ -211,7 +211,7 @@ windows. Start with [example.env](example.env).
 | Group | Required values | Notes |
 | --- | --- | --- |
 | Job | `JOB_NAME`, `NAMESPACE`, `IMAGE`, `IMAGE_PULL_SECRET`, `SERVICE_ACCOUNT`, `CREDENTIALS_SECRET` | `JOB_NAME` is a DNS label and becomes the durable run ID. Leave `IMAGE_PULL_SECRET` empty for the public image. |
-| ClickHouse | `CHHOST`, `CHPORT`, `CLUSTERNAME`, `EXPECTED_REPLICAS`, `COLLECTTABLEPREFIX` | Pin `CHHOST` to one replica for the entire cleanup. |
+| ClickHouse | `CHHOST`, `CHPORT`, `CLUSTERNAME`, `EXPECTED_REPLICAS`, `COLLECTTABLEPREFIX` | Pin `CHHOST` to one replica for the entire cleanup. `COLLECTDATABASE` (optional) qualifies the auxiliary/run-log tables' database. |
 | Object store | `S3IP`, `S3PORT`, `S3BUCKET`, `S3PATH`, `S3REGION`, `S3SECURE_FLAG`, `S3DISKNAME`, `S3AUTH`, `S3PROFILE` | `S3PROFILE` requires `S3AUTH=aws`. |
 | Limits | `SAMPLES`, `DELETE_BATCH_SIZE`, `USEAGE_HOURS`, `ACTIVE_DEADLINE_SECONDS`, `TTL_SECONDS_AFTER_FINISHED`, `MEMORY_REQUEST`, `MEMORY_LIMIT` | Keep `SAMPLES` unchanged after collect for partition pruning. |
 | Behavior | `PHASE`, `DELETE_CONFIRMATION`, `ORDER_BY_OBJPATH`, `VERBOSE` | The renderer requires the confirmation token for delete and development automation. |

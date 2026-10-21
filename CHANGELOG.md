@@ -15,6 +15,21 @@ expose.
 
 ## [Unreleased]
 
+### Added
+
+- Added `--collectdatabase`/`S3GC_COLLECTDATABASE` to qualify the auxiliary
+  and run-log tables' database explicitly, instead of only as an embedded
+  `db.prefix_` string in `COLLECTTABLEPREFIX`. A production collect Job once
+  created its auxiliary table in the ClickHouse user's current database
+  because that embedded qualification was easy to omit. The two settings must
+  agree when both are given: a conflicting pair now fails before any S3 or
+  ClickHouse call, instead of silently picking one. `COLLECTTABLEPREFIX`
+  alone still works unchanged for existing deployments. Also fixed
+  `check_samples_match_partitioning()`, which always checked
+  `currentDatabase()` and so silently skipped its `--samples`-mismatch
+  warning whenever the auxiliary table lived in a different database — a
+  second, independent bug the same incident exposed.
+
 ### Documentation
 
 - Reworked the Kubernetes guidance into a phase-based production runbook and a

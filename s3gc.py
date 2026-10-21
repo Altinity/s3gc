@@ -698,10 +698,12 @@ else:
     table_prefix = dbparts[0]
     dbname = f"`{args.collectdatabase}`" if args.collectdatabase else None
 
+# Unquoted table name, for system.tables lookups; tname is the quoted SQL form.
+aux_table_name = f"{table_prefix}{args.s3diskname}"
 if dbname:
-    tname = f"{dbname}.`{table_prefix}{args.s3diskname}`"
+    tname = f"{dbname}.`{aux_table_name}`"
 else:
-    tname = f"`{table_prefix}{args.s3diskname}`"
+    tname = f"`{aux_table_name}`"
 
 # The run-log table lives beside the auxiliary table and follows the same naming
 # convention, so one COLLECTTABLEPREFIX still identifies one cleanup. Unlike the
@@ -1229,7 +1231,7 @@ def check_samples_match_partitioning():
     try:
         rows = ch_client.query(
             "SELECT partition_key FROM system.tables "
-            f"WHERE {database_filter} AND name = '{tname.strip('`').split('.')[-1]}'"
+            f"WHERE {database_filter} AND name = '{aux_table_name}'"
         ).result_rows
     except Exception as exc:
         logger.debug(f"could not read partition_key for {tname}: {exc}")

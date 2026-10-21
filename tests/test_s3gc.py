@@ -1831,6 +1831,41 @@ def test_samples_mismatch_check_uses_the_qualified_database(
     assert "database = 'aux_db'" in client.queries[0]
 
 
+def test_samples_mismatch_check_matches_a_qualified_table_name(
+    s3gc_module, args_factory, monkeypatch, caplog
+):
+    """The partition-key lookup must use the bare table name.
+
+    Splitting a qualified tname such as `aux_db`.`aux` left a stray backtick
+    on the table component, so system.tables returned no row and the
+    --samples mismatch warning was skipped silently.
+    """
+    namespace = s3gc_module["check_samples_match_partitioning"].__globals__
+
+    class SystemTablesCH:
+        def __init__(self):
+            self.queries = []
+
+        def query(self, query):
+            self.queries.append(query)
+            if "database = 'aux_db' AND name = 'aux'" in query:
+                return QueryResult("CRC32(objpath) % 4")
+            return QueryResult(None)
+
+    client = SystemTablesCH()
+    monkeypatch.setitem(namespace, "args", args_factory(samples=3))
+    monkeypatch.setitem(namespace, "ch_client", client)
+    monkeypatch.setitem(namespace, "tname", "`aux_db`.`aux`")
+    monkeypatch.setitem(namespace, "dbname", "`aux_db`")
+    monkeypatch.setitem(namespace, "aux_table_name", "aux")
+
+    with caplog.at_level("WARNING"):
+        s3gc_module["check_samples_match_partitioning"]()
+
+    assert "name = 'aux'" in client.queries[0]
+    assert "does not match" in caplog.text
+
+
 def test_image_disables_stdout_buffering():
     """A Job killed at activeDeadlineSeconds used to lose its buffered tail.
 

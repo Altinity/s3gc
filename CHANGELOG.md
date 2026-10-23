@@ -48,11 +48,15 @@ expose.
   cluster that merely shares the database's name does not count), then reads
   each registered replica's `is_active` from `system.clusters`. An inactive
   or unknown replica exits 1 at once, with one message naming the database
-  and those replicas. Otherwise the check waits the Keeper session timeout
-  from `system.zookeeper_connection` plus `S3GC_REPLICA_LIVENESS_MARGIN_MS`
-  (default 1000 ms) and reads `is_active` again: a replica that crashed just
-  before the run stays active until Keeper expires its session (30 s on the
-  lab after `SIGKILL`). A database that is not Replicated is skipped without
+  and those replicas. Only rows with a `database_replica_name` count: a
+  configured cluster named like the database adds its own rows with
+  `is_active` NULL, which would otherwise block every phase. With
+  `S3GC_REPLICA_LIVENESS_RECHECK=true` the check also waits the Keeper
+  session timeout from `system.zookeeper_connection` plus
+  `S3GC_REPLICA_LIVENESS_MARGIN_MS` (default 1000 ms, never negative) and
+  reads `is_active` again: a replica that crashed just before the run stays
+  active until Keeper expires its session (30 s on the lab after `SIGKILL`).
+  The re-check is opt-in because it adds that wait to every run. A database that is not Replicated is skipped without
   waiting; a server that cannot report liveness logs a warning and continues.
   Liveness deliberately does not come from `clusterAllReplicas(<db>, ...)`:
   ClickHouse runs that on the other replicas as the database's

@@ -22,9 +22,10 @@ Deleting an object is irreversible. `s3gc` preserves the following controls:
 - A clustered delete checks the configured cluster and expected replica count
   before it calls S3.
 - When the auxiliary database uses `ENGINE = Replicated`, every phase checks
-  that all of its replicas are active in Keeper before it runs any DDL, and
-  checks again after the Keeper session timeout (about 30 s, plus
-  `S3GC_REPLICA_LIVENESS_MARGIN_MS`). A down replica would otherwise stall
+  that all of its replicas are active in Keeper before it runs any DDL. With
+  `S3GC_REPLICA_LIVENESS_RECHECK=true` it checks again after the Keeper
+  session timeout (about 30 s, plus `S3GC_REPLICA_LIVENESS_MARGIN_MS`), to
+  catch a replica that crashed just before the run. A down replica would otherwise stall
   each `CREATE TABLE` for `distributed_ddl_task_timeout` and surface only as
   `IncompleteRead`.
 - A failed delete Job does not retry automatically. Confirmed batches remain

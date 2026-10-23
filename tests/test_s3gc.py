@@ -1900,8 +1900,10 @@ class ReplicaLivenessCH:
         engine="Replicated",
         session_timeout_ms=30000,
         liveness_error=None,
+        configured_cluster_rows=(),
     ):
         self.engine = engine
+        self.configured_cluster_rows = list(configured_cluster_rows)
         self.snapshots = [list(snapshot) for snapshot in snapshots]
         self.current_database = current_database
         self.session_timeout_ms = session_timeout_ms
@@ -1922,7 +1924,12 @@ class ReplicaLivenessCH:
             if self.liveness_error:
                 raise self.liveness_error
             result = QueryResult(None)
-            result.result_rows = self.snapshots.pop(0) if len(self.snapshots) > 1 else self.snapshots[0]
+            rows = self.snapshots.pop(0) if len(self.snapshots) > 1 else self.snapshots[0]
+            # A configured cluster named like the database shares its rows in
+            # system.clusters, but has no database replica name.
+            if "database_replica_name" not in query:
+                rows = rows + self.configured_cluster_rows
+            result.result_rows = rows
             return result
         raise AssertionError(query)
 
@@ -1939,16 +1946,65 @@ def sleeps(s3gc_module, monkeypatch):
     return recorded
 
 
-def _replica_preflight(s3gc_module, monkeypatch, ch, dbname="`gcdb`", margin_ms=1000):
+def _replica_preflight(s3gc_module, monkeypatch, ch, dbname="`gcdb`", margin_ms=1000, recheck=True):
     namespace = s3gc_module["preflight_database_replicas"].__globals__
     monkeypatch.setitem(namespace, "ch_client", ch)
     monkeypatch.setitem(namespace, "dbname", dbname)
     monkeypatch.setattr(namespace["args"], "replica_liveness_margin_ms", margin_ms)
+    monkeypatch.setattr(namespace["args"], "replica_liveness_recheck", recheck)
     return s3gc_module["preflight_database_replicas"]
 
 
 def test_replica_liveness_margin_defaults_to_one_second(s3gc_module):
     assert s3gc_module["args"].replica_liveness_margin_ms == 1000
+
+
+def test_replica_liveness_recheck_is_off_by_default(s3gc_module):
+    assert s3gc_module["args"].replica_liveness_recheck is False
+
+
+def test_replica_preflight_without_recheck_does_not_wait(s3gc_module, monkeypatch, sleeps):
+    ch = ReplicaLivenessCH(snapshots=[BOTH_ACTIVE])
+    _replica_preflight(s3gc_module, monkeypatch, ch, recheck=False)()
+
+    assert sleeps == []
+
+
+def test_replica_preflight_without_recheck_still_rejects_an_inactive_replica(s3gc_module, monkeypatch, sleeps):
+    ch = ReplicaLivenessCH(snapshots=[SECOND_INACTIVE])
+    preflight = _replica_preflight(s3gc_module, monkeypatch, ch, recheck=False)
+
+    with pytest.raises(s3gc_module["UserVisibleError"], match="replica-1.example:9000"):
+        preflight()
+
+
+def test_replica_preflight_ignores_a_same_named_configured_cluster(s3gc_module, monkeypatch, sleeps):
+    # Seen on 26.1: a configured cluster named like the Replicated database
+    # adds its own rows to system.clusters, with is_active NULL.
+    ch = ReplicaLivenessCH(snapshots=[BOTH_ACTIVE], configured_cluster_rows=[("localhost", 9000, None)])
+    _replica_preflight(s3gc_module, monkeypatch, ch)()
+
+
+@pytest.mark.parametrize(
+    "cli, env",
+    [
+        (["--replica-liveness-margin-ms", "-1"], {}),
+        ([], {"S3GC_REPLICA_LIVENESS_MARGIN_MS": "-1"}),
+    ],
+)
+def test_negative_replica_liveness_margin_is_rejected(cli, env):
+    # A negative margin would re-check before Keeper can expire a crashed
+    # replica's session, or hand time.sleep() a negative duration.
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "s3gc.py"), *cli],
+        env={**os.environ, **env},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "replica_liveness_margin_ms" in result.stderr
 
 
 def test_replica_preflight_skips_a_non_replicated_database(s3gc_module, monkeypatch, sleeps):

@@ -334,6 +334,13 @@ parser.add_argument(
     help="Extra wait beyond the Keeper session timeout before re-checking Replicated-database replica liveness",
 )
 parser.add_argument(
+    "--replica-liveness-recheck",
+    action="store_true",
+    dest="replica_liveness_recheck",
+    help="Re-check Replicated-database replica liveness after the Keeper session timeout, "
+    "to catch a replica that crashed just before the run",
+)
+parser.add_argument(
     "--age",
     "--hours",
     "--age-hours",
@@ -586,6 +593,7 @@ BOOLEAN_DESTS = (
     "debug_flag",
     "silent_flag",
     "listoptions",
+    "replica_liveness_recheck",
 )
 
 for _dest in BOOLEAN_DESTS:
@@ -600,6 +608,12 @@ for _dest in BOOLEAN_DESTS:
             f"(environment variable S3GC_{_dest.upper()}); "
             "use one of true/false, yes/no, on/off, 1/0"
         )
+
+if args.replica_liveness_margin_ms < 0:
+    parser.error(
+        f"invalid value {args.replica_liveness_margin_ms} for replica_liveness_margin_ms "
+        "(environment variable S3GC_REPLICA_LIVENESS_MARGIN_MS); it must not be negative"
+    )
 
 if args.listoptions:
     with redirect_stdout(StringIO()) as f:
@@ -933,7 +947,8 @@ class UserVisibleError(RuntimeError):
 
 def _inactive_database_replicas(database):
     replicas = ch_client.query(
-        f"SELECT host_name, port, is_active FROM system.clusters WHERE cluster = {quote_sql_string(database)}"
+        "SELECT host_name, port, is_active FROM system.clusters "
+        f"WHERE cluster = {quote_sql_string(database)} AND database_replica_name != ''"
     ).result_rows
     return replicas, [f"{host}:{port}" for host, port, is_active in replicas if is_active != 1]
 
@@ -982,6 +997,9 @@ def preflight_database_replicas():
             )
             return
         _raise_for_inactive_replicas(database, inactive)
+        if not args.replica_liveness_recheck:
+            logger.info(f"database replica preflight passed: database={database}, replicas={len(replicas)}")
+            return
 
         # A replica that crashed moments ago stays active until Keeper expires
         # its session, so look again once that can have happened.

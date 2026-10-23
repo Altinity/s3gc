@@ -50,9 +50,9 @@ MINIMUM_USEAGE_HOURS = 24
 # reject an empty string.
 # RUNLOG defaults on: the durable run-log table is the only record that
 # outlives the Job, whose pod and logs ttlSecondsAfterFinished deletes.
-OPTIONAL = {"USETOTAL": "", "RUNLOG": "true"}
+OPTIONAL = {"USETOTAL": "", "RUNLOG": "true", "COLLECTDATABASE": ""}
 # Environment variables dropped from the manifest when they render empty.
-OPTIONAL_ENV = ("S3GC_USETOTAL",)
+OPTIONAL_ENV = ("S3GC_USETOTAL", "S3GC_COLLECTDATABASE")
 JOB_NAME_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
 
 

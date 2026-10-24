@@ -13,6 +13,11 @@ forward-looking backlog.
   fixtures, and remain excluded from CI.
 - [ ] Require the `Container / test` GitHub Actions check before pull-request
   merges in the repository branch-protection settings.
+- [ ] Surface a DDL `TIMEOUT_EXCEEDED` (159) instead of `IncompleteRead`. The
+  server sends `200 OK` before a distributed DDL times out, so the HTTP client
+  hides the cause. The Replicated-database preflight covers a replica that is
+  already down; a replica that dies after the preflight still surfaces as
+  `IncompleteRead` after `distributed_ddl_task_timeout`.
 - [ ] Consider a `TTL` on the run-log table. Volume is a few hundred rows per
   run so it is not urgent, but it grows without bound across many cleanups.
 - [ ] Drop the redundant top-level `preflight_cluster()` call in `do_use()`.

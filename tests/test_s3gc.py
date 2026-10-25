@@ -259,6 +259,79 @@ def test_connect_to_ch_builds_a_separate_writer_client(s3gc_module, monkeypatch)
     assert namespace["ch_client"] is not namespace["ch_writer"]
 
 
+def test_connect_to_ch_does_not_put_password_in_log_record(
+    s3gc_module, args_factory, monkeypatch, caplog
+):
+    namespace = s3gc_module["connect_to_ch"].__globals__
+    secret = "p7"
+    monkeypatch.setitem(
+        namespace,
+        "args",
+        args_factory(
+            chhost="clickhouse.example",
+            chport=8123,
+            chuser="s3gc",
+            chpass=secret,
+            chtimeout=60,
+        ),
+    )
+    monkeypatch.setattr(namespace["clickhouse_connect"], "get_client", lambda **_kwargs: object())
+
+    with caplog.at_level("INFO", logger=namespace["logger"].name):
+        s3gc_module["connect_to_ch"]()
+
+    assert secret not in caplog.text
+    assert "Connecting to ClickHouse" in caplog.text
+
+
+def test_debug_parameter_log_redacts_all_credential_values():
+    secrets = ("p7", "aK2", "sK3", "tK4")
+    code = """
+import runpy
+import sys
+script = sys.argv[1]
+sys.argv = [script, "--debug", "--chpass", "p7", "--s3-access-key", "aK2",
+           "--s3-secret-key", "sK3", "--s3-session-token", "tK4"]
+runpy.run_path(script, run_name="s3gc_test")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(ROOT / "s3gc.py")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Parameters:" in result.stdout
+    for secret in secrets:
+        assert secret not in result.stdout
+
+
+def test_listoptions_redacts_all_credential_values():
+    secrets = {
+        "S3GC_CHPASS": "p7",
+        "S3GC_S3ACCESSKEY": "aK2",
+        "S3GC_S3SECRETKEY": "sK3",
+        "S3GC_S3SESSIONTOKEN": "tK4",
+    }
+    env = {key: value for key, value in os.environ.items() if not key.startswith("S3GC_")}
+    env.update(secrets)
+
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "s3gc.py"), "--listoptions"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "ENV " in result.stdout
+    for name, secret in secrets.items():
+        assert f"{name}=<redacted>" in result.stdout
+        assert secret not in result.stdout
+
+
 def test_delete_entrypoint_requires_confirmation():
     result = subprocess.run(
         ["sh", str(ROOT / "docker/kubernetes-entrypoint.sh")],

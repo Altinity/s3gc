@@ -2034,6 +2034,20 @@ def test_replica_preflight_warns_when_a_replicated_database_lists_no_replicas(
     assert "lists no replicas" in caplog.text
 
 
+def test_replica_preflight_warns_when_second_liveness_read_has_no_replicas(
+    s3gc_module, monkeypatch, caplog, sleeps
+):
+    ch = ReplicaLivenessCH(snapshots=[BOTH_ACTIVE, []])
+    preflight = _replica_preflight(s3gc_module, monkeypatch, ch, recheck=True)
+
+    with caplog.at_level("INFO"):
+        preflight()
+
+    assert sleeps == [31]
+    assert "lists no replicas" in caplog.text
+    assert "preflight passed" not in caplog.text
+
+
 def test_replica_preflight_ignores_a_same_named_cluster_for_an_atomic_database(s3gc_module, monkeypatch, sleeps):
     # system.clusters also lists configured clusters. An Atomic database that
     # shares a cluster's name must not be checked: its DDL is local.

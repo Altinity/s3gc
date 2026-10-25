@@ -1011,6 +1011,12 @@ def preflight_database_replicas():
         )
         time.sleep(wait_seconds)
         replicas, inactive = _inactive_database_replicas(database)
+        if not replicas:
+            logger.warning(
+                f"Replicated database {database} lists no replicas in system.clusters "
+                "after the liveness re-check; skipping the database replica preflight"
+            )
+            return
     except clickhouse_connect.driver.exceptions.ClickHouseError as exc:
         logger.warning(
             f"cannot read replica liveness of Replicated database {database}; "

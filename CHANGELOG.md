@@ -32,6 +32,9 @@ expose.
 
 ### Fixed
 
+- The optional Replicated-database liveness re-check now warns and skips the
+  preflight when its second replica lookup returns no rows. It no longer reports
+  that a zero-replica re-check passed.
 - **Every phase now checks, before any DDL, that all replicas of a Replicated
   auxiliary database respond.** Every DDL in a database with
   `ENGINE = Replicated` waits for all replicas registered in it. With one

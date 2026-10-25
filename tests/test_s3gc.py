@@ -307,6 +307,31 @@ runpy.run_path(script, run_name="s3gc_test")
         assert secret not in result.stdout
 
 
+def test_listoptions_redacts_all_credential_values():
+    secrets = {
+        "S3GC_CHPASS": "p7",
+        "S3GC_S3ACCESSKEY": "aK2",
+        "S3GC_S3SECRETKEY": "sK3",
+        "S3GC_S3SESSIONTOKEN": "tK4",
+    }
+    env = {key: value for key, value in os.environ.items() if not key.startswith("S3GC_")}
+    env.update(secrets)
+
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "s3gc.py"), "--listoptions"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "ENV " in result.stdout
+    for name, secret in secrets.items():
+        assert f"{name}=<redacted>" in result.stdout
+        assert secret not in result.stdout
+
+
 def test_delete_entrypoint_requires_confirmation():
     result = subprocess.run(
         ["sh", str(ROOT / "docker/kubernetes-entrypoint.sh")],

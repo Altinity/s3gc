@@ -558,6 +558,7 @@ parser.add_argument("--cfg", action=ActionConfigFile)
 # print(out)
 
 args = parser.parse_args()
+SENSITIVE_ARGUMENTS = ("chpass", "s3accesskey", "s3secretkey", "s3sessiontoken")
 
 # Every flag declared with action="store_true" arrives from the environment as a
 # raw string, and every non-empty string is truthy. Normalise all boolean
@@ -608,6 +609,8 @@ if args.listoptions:
         # if (key in ['listoptions', 'verbose', 'debug', 'silent', 'keepdata', 'collectonly', 'usecollected']):
         if key in ["listoptions"]:
             continue
+        if key.lower() in SENSITIVE_ARGUMENTS and value:
+            value = "<redacted>"
         if backslash:
             print(" \\")
         print(f" S3GC_{key.upper()}={value}", end="")
@@ -674,7 +677,7 @@ consoleHandler.setFormatter(logFormatter)
 logger.addHandler(consoleHandler)
 
 diagnostic_args = vars(args).copy()
-for _secret_argument in ("chpass", "s3accesskey", "s3secretkey", "s3sessiontoken"):
+for _secret_argument in SENSITIVE_ARGUMENTS:
     if diagnostic_args.get(_secret_argument):
         diagnostic_args[_secret_argument] = "<redacted>"
 logger.debug("Parameters: %s", Namespace(**diagnostic_args))

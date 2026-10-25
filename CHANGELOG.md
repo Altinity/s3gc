@@ -22,6 +22,9 @@ expose.
   parameter dump redacts passwords, access keys, and session tokens before
   constructing the log record. This protects short credentials and handlers
   that do not use the console formatter's masking.
+- Redacted ClickHouse and S3 credentials from the `--listoptions` environment
+  output while preserving its non-secret settings, so the configuration helper
+  cannot print secrets into terminal history or captured job output.
 
 ### Added
 

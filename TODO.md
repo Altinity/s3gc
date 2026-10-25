@@ -10,15 +10,18 @@ forward-looking backlog.
   examples, explain CLI/environment/configuration precedence, and include
   examples for collect, dry-run, delete and verify. Keep existing option names
   and aliases; a naming overhaul is unnecessary.
-- [ ] Add resumable `--collectonly` collection checkpoints. A crash currently
-  restarts listing from the beginning; `--collectafter` would allow a large
-  bucket collection to resume safely.
+- [ ] Record collect progress so a crashed `--collectonly` run can resume.
+  `--collectafter` already starts listing after a given key, but nothing
+  records the last key listed, so after a crash the operator cannot tell what
+  to pass and restarts from the beginning. Write the last listed key
+  durably (for example in the run log) at each progress step.
 - [ ] Add an opt-in `dev_cluster` GCS end-to-end test. It must require explicit
   environment configuration, create an isolated tiered-policy fixture, run
   `collect → dry-run → delete → verify`, clean up ClickHouse and object-storage
   fixtures, and remain excluded from CI.
 - [ ] Require the `Container / test` GitHub Actions check before pull-request
-  merges in the repository branch-protection settings.
+  merges in the repository branch-protection settings. `master` has no branch
+  protection or ruleset today; this needs a repository admin.
 - [ ] Surface a DDL `TIMEOUT_EXCEEDED` (159) instead of `IncompleteRead`. The
   server sends `200 OK` before a distributed DDL times out, so the HTTP client
   hides the cause. The Replicated-database preflight covers a replica that is
@@ -26,10 +29,6 @@ forward-looking backlog.
   `IncompleteRead` after `distributed_ddl_task_timeout`.
 - [ ] Consider a `TTL` on the run-log table. Volume is a few hundred rows per
   run so it is not urgent, but it grows without bound across many cleanups.
-- [ ] Drop the redundant top-level `preflight_cluster()` call in `do_use()`.
-  Since the per-sample re-check landed there are two call sites, and the
-  top-level one only buys failing about one query earlier. It also makes the
-  M7 mutation ("remove the preflight call") survive the suite, because removing
-  either site alone is covered by the other. Removing site A and retargeting M7
-  at the per-sample call restores a clean 11/11. Not a defect — removing both
-  sites still fails two tests.
+  The run log is the durable record of what was deleted, so a TTL works
+  against its purpose: keep it off by default, or make it long (a year or
+  more).

@@ -15,11 +15,6 @@ import pytest
 import urllib3
 
 
-pytestmark = [pytest.mark.dev_cluster, pytest.mark.skipif(
-    os.getenv("S3GC_DEV_E2E") != "1",
-    reason="set S3GC_DEV_E2E=1 to opt in to the isolated dev-cluster test",
-)]
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -69,6 +64,48 @@ def _run_s3gc(args, env, password):
     return output
 
 
+def _assert_s3_object_missing(client, bucket, key):
+    from minio.error import S3Error
+
+    try:
+        client.stat_object(bucket, key)
+    except S3Error as exc:
+        if exc.code == "NoSuchKey":
+            return
+        raise AssertionError(f"expected S3 NoSuchKey, got {exc.code!r}") from exc
+    raise AssertionError("S3 object is still present")
+
+
+def test_s3_object_absence_requires_no_such_key():
+    from minio.error import S3Error
+
+    class FakeS3:
+        def __init__(self, *, result=None, error_code=None, exception=None):
+            self.result = result
+            self.error_code = error_code
+            self.exception = exception
+
+        def stat_object(self, _bucket, _key):
+            if self.exception:
+                raise self.exception
+            if self.error_code:
+                raise S3Error(None, self.error_code, "fixture error", "", "", "")
+            return self.result
+
+    _assert_s3_object_missing(FakeS3(error_code="NoSuchKey"), "bucket", "missing")
+    with pytest.raises(AssertionError, match="AccessDenied"):
+        _assert_s3_object_missing(FakeS3(error_code="AccessDenied"), "bucket", "present")
+    with pytest.raises(AssertionError, match="still present"):
+        _assert_s3_object_missing(FakeS3(result=object()), "bucket", "present")
+    with pytest.raises(TimeoutError):
+        _assert_s3_object_missing(FakeS3(exception=TimeoutError("network timeout")), "bucket", "unknown")
+
+
+@pytest.mark.dev_cluster
+@pytest.mark.skipif(
+    os.getenv("S3GC_DEV_E2E") != "1",
+    reason="set S3GC_DEV_E2E=1 to opt in to the isolated dev-cluster test",
+)
 def test_replicated_inventory_collect_dryrun_delete_verify():
     required = (
         "S3GC_DEV_CH_CLUSTER", "S3GC_DEV_CH_HTTP_ENDPOINTS",
@@ -183,8 +220,7 @@ def test_replicated_inventory_collect_dryrun_delete_verify():
             remaining = ch.query(f"SELECT count() FROM `{database}`.`{table}` WHERE startsWith(objpath, '{prefix}') AND active SETTINGS final=1").result_rows[0][0]
             assert remaining == 0
         for key in keys:
-            with pytest.raises(Exception):
-                client.stat_object(bucket, key)
+            _assert_s3_object_missing(client, bucket, key)
     finally:
         try:
             if database_created:

@@ -15,16 +15,19 @@ expose.
 
 ## [Unreleased]
 
-### Fixed
+Nothing yet.
 
-- Removed ClickHouse and S3 credentials from diagnostic log records. The
-  ClickHouse connection message no longer prints its password, and the debug
-  parameter dump redacts passwords, access keys, and session tokens before
-  constructing the log record. This protects short credentials and handlers
-  that do not use the console formatter's masking.
-- Redacted ClickHouse and S3 credentials from the `--listoptions` environment
-  output while preserving its non-secret settings, so the configuration helper
-  cannot print secrets into terminal history or captured job output.
+## [0.8.0] - 2026-10-25
+
+An operational release driven by two production incidents. A collect Job
+created its auxiliary table in the ClickHouse user's current database because
+the database was only expressible inside `COLLECTTABLEPREFIX`; the new
+`--collectdatabase` option makes it explicit. And a single dead replica in a
+Replicated auxiliary database cost every run about six minutes before it
+crashed with a misleading `IncompleteRead`; every phase now checks that
+database's replicas before its first DDL and fails at once, naming them.
+Credentials are also no longer printed by the connection log, the debug
+parameter dump or `--listoptions`.
 
 ### Added
 
@@ -43,6 +46,14 @@ expose.
 
 ### Fixed
 
+- Removed ClickHouse and S3 credentials from diagnostic log records. The
+  ClickHouse connection message no longer prints its password, and the debug
+  parameter dump redacts passwords, access keys, and session tokens before
+  constructing the log record. This protects short credentials and handlers
+  that do not use the console formatter's masking.
+- Redacted ClickHouse and S3 credentials from the `--listoptions` environment
+  output while preserving its non-secret settings, so the configuration helper
+  cannot print secrets into terminal history or captured job output.
 - The optional Replicated-database liveness re-check now warns and skips the
   preflight when its second replica lookup returns no rows. It no longer reports
   that a zero-replica re-check passed.

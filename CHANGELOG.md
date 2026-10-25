@@ -15,6 +15,14 @@ expose.
 
 ## [Unreleased]
 
+### Fixed
+
+- Removed ClickHouse and S3 credentials from diagnostic log records. The
+  ClickHouse connection message no longer prints its password, and the debug
+  parameter dump redacts passwords, access keys, and session tokens before
+  constructing the log record. This protects short credentials and handlers
+  that do not use the console formatter's masking.
+
 ### Added
 
 - Added `--collectdatabase`/`S3GC_COLLECTDATABASE` to qualify the auxiliary

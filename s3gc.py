@@ -14,6 +14,7 @@ There are two stages:
 It is possible to split these stages or do everything at one go.
 """
 
+from argparse import Namespace
 import os
 import sys
 from io import StringIO
@@ -672,7 +673,11 @@ consoleHandler = logging.StreamHandler(sys.stdout)  # set streamhandler to stdou
 consoleHandler.setFormatter(logFormatter)
 logger.addHandler(consoleHandler)
 
-logger.debug(f"Parameters: {args}")
+diagnostic_args = vars(args).copy()
+for _secret_argument in ("chpass", "s3accesskey", "s3secretkey", "s3sessiontoken"):
+    if diagnostic_args.get(_secret_argument):
+        diagnostic_args[_secret_argument] = "<redacted>"
+logger.debug("Parameters: %s", Namespace(**diagnostic_args))
 
 tname = ""
 dbname = None
@@ -925,7 +930,7 @@ class UserVisibleError(RuntimeError):
 
 def connect_to_ch():
     logger.info(
-        f"Connecting to ClickHouse, host={args.chhost}, port={args.chport}, username={args.chuser}, password={args.chpass}, s3path={args.s3path}, bucket={args.s3bucket}, s3path={args.s3path}"
+        f"Connecting to ClickHouse, host={args.chhost}, port={args.chport}, username={args.chuser}, s3path={args.s3path}, bucket={args.s3bucket}"
     )
     global ch_client, ch_writer
 

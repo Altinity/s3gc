@@ -30,6 +30,46 @@ expose.
   warning whenever the auxiliary table lived in a different database — a
   second, independent bug the same incident exposed.
 
+### Fixed
+
+- The optional Replicated-database liveness re-check now warns and skips the
+  preflight when its second replica lookup returns no rows. It no longer reports
+  that a zero-replica re-check passed.
+- **Every phase now checks, before any DDL, that all replicas of a Replicated
+  auxiliary database respond.** Every DDL in a database with
+  `ENGINE = Replicated` waits for all replicas registered in it. With one
+  registered replica down — its pod gone and its hostname no longer resolving —
+  the collect phase's first `CREATE TABLE IF NOT EXISTS` waited
+  `distributed_ddl_task_timeout` (180 s) and failed with `TIMEOUT_EXCEEDED`
+  (159), even though the tables already existed. The server had already sent
+  `200 OK`, so the HTTP client reported only `http.client.IncompleteRead`, and
+  the real cause was visible only in `system.query_log`. Each run lost about
+  six minutes (the run-log `CREATE`, then the auxiliary-table `CREATE`) before
+  crashing with a misleading traceback. `preflight_database_replicas()` now
+  runs right after the ClickHouse connection: it confirms in
+  `system.databases` that the database engine is `Replicated` (a configured
+  cluster that merely shares the database's name does not count), then reads
+  each registered replica's `is_active` from `system.clusters`. An inactive
+  or unknown replica exits 1 at once, with one message naming the database
+  and those replicas. Only rows with a `database_replica_name` count: a
+  configured cluster named like the database adds its own rows with
+  `is_active` NULL, which would otherwise block every phase. With
+  `S3GC_REPLICA_LIVENESS_RECHECK=true` the check also waits the Keeper
+  session timeout from `system.zookeeper_connection` plus
+  `S3GC_REPLICA_LIVENESS_MARGIN_MS` (default 1000 ms, never negative) and
+  reads `is_active` again: a replica that crashed just before the run stays
+  active until Keeper expires its session (30 s on the lab after `SIGKILL`).
+  The re-check is opt-in because it adds that wait to every run. A database that is not Replicated is skipped without
+  waiting; a server that cannot report liveness logs a warning and continues.
+  Liveness deliberately does not come from `clusterAllReplicas(<db>, ...)`:
+  ClickHouse runs that on the other replicas as the database's
+  `cluster_username`, `default` unless configured, not as the s3gc user. A
+  first version did, and on a lab whose `default` user had a password it
+  failed a healthy database with `default: Authentication failed` while the
+  DDL itself, which goes through Keeper, succeeded. Collect itself never
+  needed the other replicas — `INSERT` is not DDL — so the check guards only
+  the DDL the tool issues; the delete-time topology preflight is unchanged.
+
 ### Documentation
 
 - Reworked the Kubernetes guidance into a phase-based production runbook and a

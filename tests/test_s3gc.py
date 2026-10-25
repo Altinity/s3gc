@@ -1877,3 +1877,323 @@ def test_image_disables_stdout_buffering():
     dockerfile = (ROOT / "docker/Dockerfile").read_text()
 
     assert "ENV PYTHONUNBUFFERED=1" in dockerfile
+
+
+# --- Replicated-database replica preflight -----------------------------------
+#
+# Every DDL in a ClickHouse Replicated database waits for all registered
+# replicas. One dead replica turned the collect phase's first CREATE TABLE into
+# a 180 s wait ending in TIMEOUT_EXCEEDED (159), which the HTTP client surfaced
+# only as IncompleteRead. These pin the up-front check that replaces it.
+#
+# Liveness comes from system.clusters.is_active (the replica's Keeper session),
+# never from clusterAllReplicas: that connects to the other replicas as the
+# database's cluster_username, `default` unless configured, so a hardened
+# `default` user failed the check on a healthy database.
+
+
+class ReplicaLivenessCH:
+    def __init__(
+        self,
+        snapshots=(),
+        current_database="default",
+        engine="Replicated",
+        session_timeout_ms=30000,
+        liveness_error=None,
+        configured_cluster_rows=(),
+    ):
+        self.engine = engine
+        self.configured_cluster_rows = list(configured_cluster_rows)
+        self.snapshots = [list(snapshot) for snapshot in snapshots]
+        self.current_database = current_database
+        self.session_timeout_ms = session_timeout_ms
+        self.liveness_error = liveness_error
+        self.queries = []
+
+    def query(self, query):
+        self.queries.append(query)
+        if "currentDatabase()" in query:
+            return QueryResult(self.current_database)
+        if "system.databases" in query:
+            result = QueryResult(self.engine)
+            result.result_rows = [(self.engine,)] if self.engine else []
+            return result
+        if "system.zookeeper_connection" in query:
+            return QueryResult(self.session_timeout_ms)
+        if "system.clusters" in query:
+            if self.liveness_error:
+                raise self.liveness_error
+            result = QueryResult(None)
+            rows = self.snapshots.pop(0) if len(self.snapshots) > 1 else self.snapshots[0]
+            # A configured cluster named like the database shares its rows in
+            # system.clusters, but has no database replica name.
+            if "database_replica_name" not in query:
+                rows = rows + self.configured_cluster_rows
+            result.result_rows = rows
+            return result
+        raise AssertionError(query)
+
+
+BOTH_ACTIVE = [("replica-0.example", 9000, 1), ("replica-1.example", 9000, 1)]
+SECOND_INACTIVE = [("replica-0.example", 9000, 1), ("replica-1.example", 9000, 0)]
+SECOND_UNKNOWN = [("replica-0.example", 9000, 1), ("replica-1.example", 9000, None)]
+
+
+@pytest.fixture
+def sleeps(s3gc_module, monkeypatch):
+    recorded = []
+    monkeypatch.setattr(s3gc_module["time"], "sleep", recorded.append)
+    return recorded
+
+
+def _replica_preflight(s3gc_module, monkeypatch, ch, dbname="`gcdb`", margin_ms=1000, recheck=True):
+    namespace = s3gc_module["preflight_database_replicas"].__globals__
+    monkeypatch.setitem(namespace, "ch_client", ch)
+    monkeypatch.setitem(namespace, "dbname", dbname)
+    monkeypatch.setattr(namespace["args"], "replica_liveness_margin_ms", margin_ms)
+    monkeypatch.setattr(namespace["args"], "replica_liveness_recheck", recheck)
+    return s3gc_module["preflight_database_replicas"]
+
+
+def test_replica_liveness_margin_defaults_to_one_second(s3gc_module):
+    assert s3gc_module["args"].replica_liveness_margin_ms == 1000
+
+
+def test_replica_liveness_recheck_is_off_by_default(s3gc_module):
+    assert s3gc_module["args"].replica_liveness_recheck is False
+
+
+def test_replica_preflight_without_recheck_does_not_wait(s3gc_module, monkeypatch, sleeps):
+    ch = ReplicaLivenessCH(snapshots=[BOTH_ACTIVE])
+    _replica_preflight(s3gc_module, monkeypatch, ch, recheck=False)()
+
+    assert sleeps == []
+
+
+def test_replica_preflight_without_recheck_still_rejects_an_inactive_replica(s3gc_module, monkeypatch, sleeps):
+    ch = ReplicaLivenessCH(snapshots=[SECOND_INACTIVE])
+    preflight = _replica_preflight(s3gc_module, monkeypatch, ch, recheck=False)
+
+    with pytest.raises(s3gc_module["UserVisibleError"], match="replica-1.example:9000"):
+        preflight()
+
+
+def test_replica_preflight_ignores_a_same_named_configured_cluster(s3gc_module, monkeypatch, sleeps):
+    # Seen on 26.1: a configured cluster named like the Replicated database
+    # adds its own rows to system.clusters, with is_active NULL.
+    ch = ReplicaLivenessCH(snapshots=[BOTH_ACTIVE], configured_cluster_rows=[("localhost", 9000, None)])
+    _replica_preflight(s3gc_module, monkeypatch, ch)()
+
+
+@pytest.mark.parametrize(
+    "cli, env",
+    [
+        (["--replica-liveness-margin-ms", "-1"], {}),
+        ([], {"S3GC_REPLICA_LIVENESS_MARGIN_MS": "-1"}),
+    ],
+)
+def test_negative_replica_liveness_margin_is_rejected(cli, env):
+    # A negative margin would re-check before Keeper can expire a crashed
+    # replica's session, or hand time.sleep() a negative duration.
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "s3gc.py"), *cli],
+        env={**os.environ, **env},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "replica_liveness_margin_ms" in result.stderr
+
+
+def test_replica_preflight_skips_a_non_replicated_database(s3gc_module, monkeypatch, sleeps):
+    ch = ReplicaLivenessCH(snapshots=[[]], engine="Atomic")
+    _replica_preflight(s3gc_module, monkeypatch, ch)()
+
+    assert not any("system.clusters" in query for query in ch.queries)
+
+
+def test_replica_preflight_does_not_wait_for_a_non_replicated_database(s3gc_module, monkeypatch, sleeps):
+    ch = ReplicaLivenessCH(snapshots=[[]], engine="Atomic")
+    _replica_preflight(s3gc_module, monkeypatch, ch)()
+
+    assert sleeps == []
+
+
+def test_replica_preflight_warns_when_a_replicated_database_lists_no_replicas(
+    s3gc_module, monkeypatch, caplog, sleeps
+):
+    # Nothing to check, so the run continues -- but say so, rather than let a
+    # missing system.clusters entry silently disable the check.
+    ch = ReplicaLivenessCH(snapshots=[[]])
+
+    with caplog.at_level("WARNING"):
+        _replica_preflight(s3gc_module, monkeypatch, ch)()
+
+    assert "lists no replicas" in caplog.text
+
+
+def test_replica_preflight_warns_when_second_liveness_read_has_no_replicas(
+    s3gc_module, monkeypatch, caplog, sleeps
+):
+    ch = ReplicaLivenessCH(snapshots=[BOTH_ACTIVE, []])
+    preflight = _replica_preflight(s3gc_module, monkeypatch, ch, recheck=True)
+
+    with caplog.at_level("INFO"):
+        preflight()
+
+    assert sleeps == [31]
+    assert "lists no replicas" in caplog.text
+    assert "preflight passed" not in caplog.text
+
+
+def test_replica_preflight_ignores_a_same_named_cluster_for_an_atomic_database(s3gc_module, monkeypatch, sleeps):
+    # system.clusters also lists configured clusters. An Atomic database that
+    # shares a cluster's name must not be checked: its DDL is local.
+    ch = ReplicaLivenessCH(snapshots=[SECOND_INACTIVE], engine="Atomic")
+    _replica_preflight(s3gc_module, monkeypatch, ch)()
+
+    assert not any("system.clusters" in query for query in ch.queries)
+
+
+def test_replica_preflight_passes_when_every_replica_stays_active(s3gc_module, monkeypatch, sleeps):
+    ch = ReplicaLivenessCH(snapshots=[BOTH_ACTIVE])
+
+    _replica_preflight(s3gc_module, monkeypatch, ch)()
+
+
+def test_replica_preflight_never_connects_to_other_replicas(s3gc_module, monkeypatch, sleeps):
+    # Regression: clusterAllReplicas authenticated to the other replicas as
+    # `default`, failing a healthy database whose `default` user was hardened.
+    ch = ReplicaLivenessCH(snapshots=[BOTH_ACTIVE])
+    _replica_preflight(s3gc_module, monkeypatch, ch)()
+
+    assert not any("clusterAllReplicas" in query for query in ch.queries)
+
+
+def test_replica_preflight_reads_replica_liveness_from_system_clusters(s3gc_module, monkeypatch, sleeps):
+    ch = ReplicaLivenessCH(snapshots=[BOTH_ACTIVE])
+    _replica_preflight(s3gc_module, monkeypatch, ch)()
+
+    assert any("is_active" in query and "system.clusters" in query for query in ch.queries)
+
+
+def test_replica_preflight_looks_up_the_auxiliary_tables_database(s3gc_module, monkeypatch, sleeps):
+    ch = ReplicaLivenessCH(snapshots=[BOTH_ACTIVE])
+    _replica_preflight(s3gc_module, monkeypatch, ch, dbname="`gcdb`")()
+
+    assert any("cluster = 'gcdb'" in query for query in ch.queries)
+
+
+def test_replica_preflight_defaults_to_the_current_database(s3gc_module, monkeypatch, sleeps):
+    ch = ReplicaLivenessCH(snapshots=[BOTH_ACTIVE], current_database="userdb")
+    _replica_preflight(s3gc_module, monkeypatch, ch, dbname=None)()
+
+    assert any("cluster = 'userdb'" in query for query in ch.queries)
+
+
+def test_replica_preflight_rejects_an_inactive_replica(s3gc_module, monkeypatch, sleeps):
+    ch = ReplicaLivenessCH(snapshots=[SECOND_INACTIVE])
+    preflight = _replica_preflight(s3gc_module, monkeypatch, ch)
+
+    with pytest.raises(s3gc_module["UserVisibleError"], match="replica-1.example:9000"):
+        preflight()
+
+
+def test_replica_preflight_rejects_an_inactive_replica_without_waiting(s3gc_module, monkeypatch, sleeps):
+    ch = ReplicaLivenessCH(snapshots=[SECOND_INACTIVE])
+    preflight = _replica_preflight(s3gc_module, monkeypatch, ch)
+
+    with pytest.raises(s3gc_module["UserVisibleError"]):
+        preflight()
+    assert sleeps == []
+
+
+def test_replica_preflight_error_does_not_name_an_active_replica(s3gc_module, monkeypatch, sleeps):
+    ch = ReplicaLivenessCH(snapshots=[SECOND_INACTIVE])
+    preflight = _replica_preflight(s3gc_module, monkeypatch, ch)
+
+    with pytest.raises(s3gc_module["UserVisibleError"]) as error:
+        preflight()
+    assert "replica-0.example" not in str(error.value)
+
+
+def test_replica_preflight_rejects_a_replica_of_unknown_liveness(s3gc_module, monkeypatch, sleeps):
+    ch = ReplicaLivenessCH(snapshots=[SECOND_UNKNOWN])
+    preflight = _replica_preflight(s3gc_module, monkeypatch, ch)
+
+    with pytest.raises(s3gc_module["UserVisibleError"], match="replica-1.example:9000"):
+        preflight()
+
+
+def test_replica_preflight_waits_the_keeper_session_timeout_plus_margin(s3gc_module, monkeypatch, sleeps):
+    # A replica that crashed moments ago stays is_active until Keeper expires
+    # its session, so look again only after that.
+    ch = ReplicaLivenessCH(snapshots=[BOTH_ACTIVE], session_timeout_ms=45000)
+    _replica_preflight(s3gc_module, monkeypatch, ch, margin_ms=1500)()
+
+    assert sleeps == [46.5]
+
+
+def test_replica_preflight_rejects_a_replica_that_expires_during_the_wait(s3gc_module, monkeypatch, sleeps):
+    ch = ReplicaLivenessCH(snapshots=[BOTH_ACTIVE, SECOND_INACTIVE])
+    preflight = _replica_preflight(s3gc_module, monkeypatch, ch)
+
+    with pytest.raises(s3gc_module["UserVisibleError"], match="replica-1.example:9000"):
+        preflight()
+
+
+def test_replica_preflight_warns_when_liveness_cannot_be_read(s3gc_module, monkeypatch, caplog, sleeps):
+    # An older server without is_active must keep the pre-check behaviour,
+    # not block every run -- but say the check was skipped.
+    from clickhouse_connect.driver.exceptions import DatabaseError
+
+    ch = ReplicaLivenessCH(snapshots=[BOTH_ACTIVE], liveness_error=DatabaseError("UNKNOWN_IDENTIFIER is_active"))
+
+    with caplog.at_level("WARNING"):
+        _replica_preflight(s3gc_module, monkeypatch, ch)()
+
+    assert "UNKNOWN_IDENTIFIER is_active" in caplog.text
+
+
+def _record_main_steps(s3gc_module, args_factory, monkeypatch, preflight_error=None):
+    namespace = s3gc_module["main"].__globals__
+    steps = []
+
+    def step(name, error=None):
+        def run(*_args, **_kwargs):
+            steps.append(name)
+            if error:
+                raise error
+        return run
+
+    monkeypatch.setitem(
+        namespace,
+        "args",
+        args_factory(usecollected_flag=False, collectonly_flag=True, debug_flag=False, dryrun_flag=False),
+    )
+    monkeypatch.setitem(namespace, "connect_to_ch", step("connect_to_ch"))
+    monkeypatch.setitem(namespace, "preflight_database_replicas", step("preflight_database_replicas", preflight_error))
+    monkeypatch.setitem(namespace, "init_run_log", step("init_run_log"))
+    monkeypatch.setitem(namespace, "connect_to_s3", step("connect_to_s3"))
+    monkeypatch.setitem(namespace, "do_collect", step("do_collect"))
+    monkeypatch.setitem(namespace, "graceful_exit", step("graceful_exit"))
+    return namespace["main"], steps
+
+
+def test_main_checks_database_replicas_before_any_ddl(s3gc_module, args_factory, monkeypatch):
+    main, steps = _record_main_steps(s3gc_module, args_factory, monkeypatch)
+    main()
+
+    assert steps[:3] == ["connect_to_ch", "preflight_database_replicas", "init_run_log"]
+
+
+def test_main_stops_before_any_ddl_when_a_replica_is_down(s3gc_module, args_factory, monkeypatch):
+    error = s3gc_module["UserVisibleError"]("replica down")
+    main, steps = _record_main_steps(s3gc_module, args_factory, monkeypatch, preflight_error=error)
+
+    with pytest.raises(SystemExit) as exit_info:
+        main()
+
+    assert (exit_info.value.code, steps) == (1, ["connect_to_ch", "preflight_database_replicas"])

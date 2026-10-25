@@ -6,12 +6,13 @@ cluster and S3 prefix. The test must never run in the default pytest suite.
 
 Acceptance criteria:
 
-- The test requires explicit opt-in, a named ClickHouse client connection, a
-  two-replica cluster, the S3 bucket and region, and IAM-backed S3 access.
+- The test requires explicit opt-in, ClickHouse credentials from a named
+  client connection or Kubernetes Secret environment, two distinct replica
+  endpoints, the S3 bucket and region, and IAM-backed S3 access.
 - It creates a unique Replicated database and
   `ReplicatedReplacingMergeTree` inventory, seeds only uniquely prefixed test
-  objects, and reuses the table across collect, dry-run, delete and verify on
-  both replicas with synchronization between phases.
+  objects, collects on one replica, then runs dry-run and delete on the other.
+  Synchronization and verification check the inventory on both replicas.
 - It deletes only the seeded fixture keys, confirms the dry-run candidate set
   matches them, verifies replicated tombstones and missing S3 keys, and cleans
   up only its own database and objects on success or failure.

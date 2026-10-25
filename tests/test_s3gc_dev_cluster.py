@@ -64,6 +64,13 @@ def _run_s3gc(args, env, password):
     return output
 
 
+def _env_for_endpoint(env, endpoint):
+    host, port = endpoint
+    phase_env = env.copy()
+    phase_env.update({"S3GC_CHHOST": host, "S3GC_CHPORT": str(port)})
+    return phase_env
+
+
 def _assert_s3_object_missing(client, bucket, key):
     from minio.error import S3Error
 
@@ -164,6 +171,11 @@ def test_replicated_inventory_collect_dryrun_delete_verify():
     )
     ch_clients = [get_client(host=host_, port=port, username=username, password=password)
                   for host_, port in parsed_endpoints]
+    replica_names = {
+        ch.query("SELECT hostName()").result_rows[0][0]
+        for ch in ch_clients
+    }
+    assert len(replica_names) == 2, "HTTP endpoints must reach two distinct ClickHouse replicas"
     env = os.environ.copy()
     env.update({
         "S3GC_CHHOST": parsed_endpoints[0][0], "S3GC_CHUSER": username, "S3GC_CHPASS": password,
@@ -194,7 +206,9 @@ def test_replicated_inventory_collect_dryrun_delete_verify():
              "ENGINE = ReplicatedReplacingMergeTree ORDER BY objpath PARTITION BY CRC32(objpath) % 1")
         for ch in ch_clients:
             _sql(ch, f"SYSTEM SYNC DATABASE REPLICA `{database}`")
-        _run_s3gc(["--collect-only", "--non-interactive"], env, password)
+        first_replica_env = _env_for_endpoint(env, parsed_endpoints[0])
+        second_replica_env = _env_for_endpoint(env, parsed_endpoints[1])
+        _run_s3gc(["--collect-only", "--non-interactive"], first_replica_env, password)
         _sql(ch_clients[0], f"SYSTEM SYNC REPLICA ON CLUSTER `{cluster}` `{database}`.`{table}` LIGHTWEIGHT")
 
         # Backdate only this generated fixture inventory; keep s3gc's production
@@ -207,14 +221,18 @@ def test_replicated_inventory_collect_dryrun_delete_verify():
             rows = ch.query(f"SELECT count() FROM `{database}`.`{table}` WHERE startsWith(objpath, '{prefix}') SETTINGS final=1").result_rows[0][0]
             assert rows == len(keys)
 
-        dryrun = _run_s3gc(["--use-collected", "--dry-run", "--debug", "--non-interactive"], env, password)
+        dryrun = _run_s3gc(
+            ["--use-collected", "--dry-run", "--debug", "--non-interactive"],
+            second_replica_env,
+            password,
+        )
         candidates = {
             line.split("would remove if no dryrun flag", 1)[1].split(" of size", 1)[0].strip()
             for line in dryrun.splitlines() if "would remove if no dryrun flag" in line
         }
         assert candidates == set(keys)
 
-        _run_s3gc(["--use-collected", "--non-interactive"], env, password)
+        _run_s3gc(["--use-collected", "--non-interactive"], second_replica_env, password)
         _sql(ch_clients[0], f"SYSTEM SYNC REPLICA ON CLUSTER `{cluster}` `{database}`.`{table}` LIGHTWEIGHT")
         for ch in ch_clients:
             remaining = ch.query(f"SELECT count() FROM `{database}`.`{table}` WHERE startsWith(objpath, '{prefix}') AND active SETTINGS final=1").result_rows[0][0]

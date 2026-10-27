@@ -4,12 +4,6 @@ Possible, interesting, and deliberately deferred engineering or operational
 improvements. Completed behaviour belongs in `CHANGELOG.md`; this file is the
 forward-looking backlog.
 
-- [ ] In a separate documentation PR, document every CLI parameter: its purpose,
-  accepted values, default, aliases, exact `S3GC_*` environment variable name,
-  and interactions or constraints. Prefer existing kebab-case aliases in
-  examples, explain CLI/environment/configuration precedence, and include
-  examples for collect, dry-run, delete and verify. Keep existing option names
-  and aliases; a naming overhaul is unnecessary.
 - [ ] Record collect progress so a crashed `--collectonly` run can resume.
   `--collectafter` already starts listing after a given key, but nothing
   records the last key listed, so after a crash the operator cannot tell what

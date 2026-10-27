@@ -15,7 +15,14 @@ expose.
 
 ## [Unreleased]
 
-Nothing yet.
+### Documentation
+
+- Added a complete CLI and configuration reference, including aliases,
+  environment variables, defaults, precedence, and phase examples. Explained
+  how `--usecollected` reuses an inventory and documented a manually reviewed
+  shared-bucket workflow, because a single configured cluster cannot identify
+  references held by independent clusters. Clarified that `USETOTAL` applies
+  per sample rather than as a global Job limit.
 
 ## [0.8.0] - 2026-10-25
 

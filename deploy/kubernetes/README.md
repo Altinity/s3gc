@@ -193,8 +193,16 @@ kubectl -n <namespace> logs -f job/<job-name>
 | Verify | Set `PHASE=dry-run`, a new `JOB_NAME`, and clear `DELETE_CONFIRMATION`. | Report zero candidates. |
 
 Do not run delete from an unreviewed dry-run. Before the first full delete for
-a new image or cluster, set `USETOTAL` to a few thousand objects for one
-bounded delete. Clear it before the full run.
+a new image or cluster, set `USETOTAL` to a few thousand objects per sample
+for a bounded trial delete. Clear it before the full run and verification.
+The use-phase query applies this limit separately to each sample, so it is not
+a global cap on the Job.
+
+The entrypoint uses `--collectonly --keepdata` for collection,
+`--usecollected --dry-run` for review and verification, and
+`--usecollected --keepdata --non-interactive` for delete after the token and
+topology-input gates. See the [CLI reference](../../docs/cli-reference.md) for
+all parameters and the [manual shared-bucket workflow](../../docs/cli-reference.md#manual-inventory-for-a-bucket-shared-by-independent-clusters).
 
 ### 5. Recover or verify
 
@@ -219,7 +227,7 @@ windows. Start with [example.env](example.env).
 | Limits | `SAMPLES`, `DELETE_BATCH_SIZE`, `USEAGE_HOURS`, `ACTIVE_DEADLINE_SECONDS`, `TTL_SECONDS_AFTER_FINISHED`, `MEMORY_REQUEST`, `MEMORY_LIMIT` | Keep `SAMPLES` unchanged after collect for partition pruning. |
 | Behavior | `PHASE`, `DELETE_CONFIRMATION`, `ORDER_BY_OBJPATH`, `VERBOSE` | The renderer requires the confirmation token for delete and development automation. |
 
-`USETOTAL` is optional and limits one use phase. `RUNLOG` defaults to `true`;
+`USETOTAL` is optional and limits each sample in a use phase. `RUNLOG` defaults to `true`;
 set it to `false` only when stdout is an adequate operational record.
 
 ## Durable run history

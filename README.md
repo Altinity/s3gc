@@ -45,6 +45,10 @@ would look orphaned.
 
 Use a unique collection-table prefix for each bucket and prefix. Never commit
 credentials, rendered manifests, target-cluster details, or run output.
+If independent clusters share an overlapping bucket or prefix, review references
+from every consumer before importing a candidate inventory. The
+[shared-bucket workflow](docs/cli-reference.md#manual-inventory-for-a-bucket-shared-by-independent-clusters)
+explains this manual preparation and the limits of the configured-cluster check.
 
 ## Local setup and read-only preview
 
@@ -83,6 +87,11 @@ in a file or command history. Then run a preview:
 ```bash
 .venv/bin/python s3gc.py --verbose --dry-run
 ```
+
+This preview collects an inventory first. To preview an existing inventory
+without listing again, use `--use-collected --dry-run`. See the complete
+[CLI and configuration reference](docs/cli-reference.md) for every parameter,
+aliases, environment variables, defaults, and phase examples.
 
 Use direct deletion only for controlled development work. The Kubernetes
 runbook separates collection, review, approval, deletion, and verification.

@@ -1,6 +1,10 @@
 # Plan: complete CLI parameter documentation
 
 Status: implemented on `docs/cli-parameter-reference`.
+This completed plan records the original work. Use the
+[CLI reference](../cli-reference.md) and
+[Kubernetes runbook](../../deploy/kubernetes/README.md) for current instructions.
+
 Planning branch: `docs/cli-reference-plan`.
 Proposed implementation branch: `docs/cli-parameter-reference`.
 

@@ -1,35 +1,34 @@
 # Contributor guide — s3gc
 
-`s3gc` is a Python command-line tool and Kubernetes Job workflow for finding
-and deleting orphaned objects from ClickHouse S3 disks and compatible object
-storage. It is an operationally destructive tool: quality is held by offline
-tests, explicit delete controls, and conservative deployment defaults.
+`s3gc` finds and deletes orphaned objects from ClickHouse S3 disks and compatible
+object storage. It provides a Python CLI and a Kubernetes Job workflow. Deletion
+is irreversible, so preserve the offline tests and operational safeguards.
 
 ## Hard rules
 
-1. **The deletion lifecycle is non-negotiable.** The normal production flow is
+1. **Preserve the deletion lifecycle.** The normal production flow is
    `collect → dry-run → explicit customer approval → delete → verify`. Preserve
    the delete confirmation token, ClickHouse cluster and expected-replica
-   preflight, deletion checkpoints, and the rule that a failed delete job does
-   not retry automatically. A behavior change in this path needs regression
-   tests and matching README/deployment documentation.
+   preflight, deletion checkpoints, and the rule that a failed delete Job
+   is not rerun automatically. A behavior change in this path needs regression
+   tests and matching README and deployment documentation. Job reruns are
+   separate from HTTP retries within a running process.
 
 2. **Spec-first TDD is mandatory.** For every new feature, bug fix, or
    material operational behaviour change, start with a short spec in the
-   commit that begins the change: one or two sentences on the problem or
-   intent, plus a short bullet list of acceptance criteria — what must be true
-   when it's done. If the request doesn't already answer these, run Spec
-   Intake first (see below). Then use TDD: for each acceptance criterion,
-   write the failing test that covers it before making it pass. Add a
-   regression test for every defect. Purely editorial changes are exempt from
-   both the spec and TDD.
+   commit that begins the change. State the problem in one or two sentences
+   and list the acceptance criteria. Run Spec Intake below if details are
+   missing. For each criterion, write a failing test before implementing the
+   change. Add a regression test for every defect. Purely editorial changes
+   are exempt from both the spec and TDD.
 
 3. **Tests stay offline by default.** Install both requirements files, then
-   run `pytest -v` for relevant changes. Tests must use fakes, local
-   subprocesses, and manifest dry-runs; they must not contact live ClickHouse,
-   S3-compatible storage, or delete objects. The `dev_cluster` marker is
-   explicitly environment-dependent and never runs in CI. Do not add live
-   credentials or a live-delete test path to the default suite.
+   run the relevant offline suite with `-m "not dev_cluster"`. Default tests
+   use fakes, local subprocesses, and manifest dry-runs. They must not contact
+   live ClickHouse or object storage, or delete objects. Tests marked
+   `dev_cluster` require explicit opt-in and an isolated development environment.
+   They never run in CI. Do not add live credentials or live-delete paths to
+   the default suite.
 
 4. **No secrets or customer artifacts in Git.** Do not commit S3 keys,
    ClickHouse passwords, customer `.env` files, rendered customer manifests,
@@ -40,19 +39,19 @@ tests, explicit delete controls, and conservative deployment defaults.
 5. **Kubernetes deployment stays immutable and least-privileged.**
    `deploy/kubernetes/render.py` must continue to reject unpinned images and
    invalid phase/confirmation input. Use image digests, never mutable tags.
-   Preserve the Job template's non-root user and read-only root filesystem;
-   do not embed credentials in the image or manifest.
+   Preserve the Job template's non-root user and read-only root filesystem.
+   Do not embed credentials in the image or manifest.
 
 6. **Dependencies are deliberate and reproducible.** Runtime dependencies are
-   pinned in `requirements.txt`; test-only dependencies are pinned in
+   pinned in `requirements.txt`. Test-only dependencies are pinned in
    `requirements-dev.txt`. Use both files when preparing a development or CI
    environment. Add or update a dependency only when it is necessary for the
    requested capability, and test the resulting workflow.
 
-7. **Read project history and backlog before substantive changes.** Review
-   `CHANGELOG.md` for recent behaviour and operational evidence, then `TODO.md`
-   for possible, interesting, and deliberately deferred improvements. Do not
-   treat a TODO item as already implemented or use the changelog as a backlog.
+7. **Read the history and backlog before substantive changes.** Read
+   `CHANGELOG.md` for behavior changes and operational evidence, then `TODO.md`
+   for deferred work. A TODO item is not implemented. The changelog records
+   completed work, not the backlog.
 
 ## Spec Intake
 
@@ -73,15 +72,16 @@ already answers these, skip straight to the spec.
 | Path | Purpose |
 | --- | --- |
 | `s3gc.py` | CLI arguments, ClickHouse inventory/anti-join, S3 collection and deletion, safety preflight, and checkpoints. |
+| `docs/cli-reference.md` | Parameter details, configuration, phase examples, and manual shared-bucket inventory. |
 | `tests/` | Pytest regression tests using fakes and local subprocesses. |
 | `docker/Dockerfile` | Minimal Python 3.11 production image. |
 | `docker/kubernetes-entrypoint.sh` | Phase dispatcher and delete/dev-automation confirmation gate. |
 | `deploy/kubernetes/render.py` | Validates a non-secret environment file and renders the Job manifest. |
 | `deploy/kubernetes/job.yaml.tmpl` | Kubernetes Job template with security context and environment wiring. |
-| `deploy/kubernetes/example.env` | Non-secret rendering example; copy it outside the repository for a real run. |
+| `deploy/kubernetes/example.env` | Non-secret rendering example. Copy it outside the repository for a real run. |
 | `.github/workflows/container.yml` | CI test, render, manifest validation, and container publication workflow. |
-| `CHANGELOG.md` | Shipped behaviour and **why**, including evidence for defects found in production use. Update it in the same change as any behaviour, safety, or deployment change. |
-| `TODO.md` | Possible, interesting, and deliberately deferred engineering or operational improvements. Move completed work to the changelog when it lands. |
+| `CHANGELOG.md` | Completed changes and their reasons, including production evidence. Update it with behavior, safety, and deployment changes. |
+| `TODO.md` | Deferred engineering and operational work. Move completed items to the changelog. |
 
 ## Required checks
 
@@ -109,16 +109,12 @@ percentage until coverage tooling and an enforceable threshold are introduced.
 
 - Keep the command-line and `S3GC_*` environment interfaces compatible unless
   the task explicitly authorizes a breaking operational change.
-- Record behaviour, safety and deployment changes in `CHANGELOG.md` as part of
-  the same change. Write down *why*, and keep the evidence for defects found in
-  production — the reasoning is the expensive part to reconstruct later. Never
-  put customer names, cluster identifiers or credentials there.
-- Record possible, interesting, or pending engineering and operational
-  improvements in `TODO.md`, not in the changelog. Remove or update the TODO
-  item when the work lands.
-- Treat the renderer, entrypoint, README, and Kubernetes guide as part of the
-  same operator-facing contract. Update the affected documentation in the same
-  change as an operational behavior change.
+- Record behavior, safety, and deployment changes in `CHANGELOG.md` with the
+  change itself. Explain why and preserve production evidence without customer
+  names, cluster identifiers, or credentials.
+- Put deferred work in `TODO.md`. Remove or update the item when it lands.
+- Keep the renderer, entrypoint, README, CLI reference, and Kubernetes guide in
+  agreement. Update the affected docs with each operational behavior change.
 - Surface out-of-scope safety defects rather than silently changing them. State
   the file and risk, and defer the fix unless it is necessary to keep the
   current task safe.

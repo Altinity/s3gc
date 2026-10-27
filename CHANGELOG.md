@@ -2,16 +2,12 @@
 
 Notable changes to `s3gc`, newest first.
 
-This file records **what changed and why**, with enough context that someone
-picking the repository up later — human or agent — can tell a deliberate design
-decision from an accident. Defects found by running the tool against real
-clusters carry their evidence, because the reasoning is usually the expensive
-part to reconstruct.
+This file records **what changed and why**. Preserve the evidence for defects
+found on real clusters so later readers can understand the decisions.
 
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
-Customer names, cluster identifiers and credentials never appear here (see
-`CLAUDE.md`, rule 3); findings are described in terms of the behaviour they
-expose.
+Keep customer names, cluster identifiers, and credentials out of this file.
+See `CLAUDE.md`, rule 4. Describe findings by the behavior they expose.
 
 ## [Unreleased]
 
@@ -23,6 +19,10 @@ expose.
   shared-bucket workflow, because a single configured cluster cannot identify
   references held by independent clusters. Clarified that `USETOTAL` applies
   per sample rather than as a global Job limit.
+- Simplified current operator and contributor guidance while preserving release
+  history. Aligned logging names, listing permissions, inventory recovery,
+  preflight limitations, and Job retry wording. Connected the packaged skill
+  to the manual shared-bucket workflow and clarified its table-creation examples.
 
 ## [0.8.0] - 2026-10-25
 

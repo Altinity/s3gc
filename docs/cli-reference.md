@@ -70,6 +70,10 @@ run does not impose that requirement when the count is unset.
 | <a id="option-s3_read_timeout"></a>`--s3-read-timeout` | `S3GC_S3_READ_TIMEOUT` / `s3_read_timeout` | `120`. Integer S3 read timeout in seconds. |
 | <a id="option-s3_retries"></a>`--s3-retries` | `S3GC_S3_RETRIES` / `s3_retries` | `3`. Integer HTTP retry count for transient S3 errors. |
 
+HTTP retries happen within a running process. Batch deletion can also reconnect
+and retry once after a transport failure. These retries are separate from
+Kubernetes Job reruns, which the manifest disables.
+
 Static mode does not automatically read the standard `AWS_ACCESS_KEY_ID` and
 `AWS_SECRET_ACCESS_KEY` variables. Supply the corresponding `S3GC_*` values
 through a secret manager, or choose an appropriate AWS/IAM mode. Collection
@@ -283,6 +287,18 @@ expected by s3gc. This example uses `S3GC_COLLECTDATABASE=s3gc`,
 `S3GC_COLLECTTABLEPREFIX=manual_cleanup_`, `S3GC_S3DISKNAME=s3`, and
 `S3GC_SAMPLES=4`. Use a unique Keeper path and a cluster with correctly
 configured `{shard}` and `{replica}` macros. Review the DDL for the installation.
+
+Check the database engine before choosing how to create the table:
+
+```sql
+SELECT engine FROM system.databases WHERE name = 's3gc';
+```
+
+The `CREATE TABLE` example below uses `ON CLUSTER` for an Atomic database.
+If `s3gc` uses `ENGINE = Replicated`, omit `ON CLUSTER '<cleanup-cluster>'`.
+That database distributes table DDL itself. See the
+[Replicated database documentation](https://clickhouse.com/docs/engines/database-engines/replicated).
+
 The table engine replicates data within a shard. It does not automatically
 share rows across independent shards or clusters. Table replication is separate
 from a Replicated database's DDL replication. See ClickHouse's
@@ -310,17 +326,20 @@ clickhouse-client --host '<pinned-replica>' \
   < "$S3GC_RUN_DIR/reviewed-candidates.csv"
 ```
 
-Verify the imported keys and metadata against the reviewed CSV, including count
-and total bytes, and confirm replication has caught up where the table will be read. Replication is
-asynchronous. Pinning all s3gc phases to the import replica avoids assuming an
-immediate copy elsewhere. A partial import or an empty candidate table is not a
-successful cleanup: resolve it before proceeding. The normal s3gc collector
-creates a node-local table. It does not create this replicated table for you.
+Compare the imported keys, metadata, count, and total bytes with the reviewed
+CSV. Confirm replication has caught up where the table will be read. Replication
+is asynchronous, so keep all s3gc phases pinned to the import replica.
+Resolve any partial import before proceeding. An empty candidate table cannot
+be passed to the use phase. If the review found no candidates, record that
+result instead of starting delete.
+
+The normal s3gc collector creates a node-local table. You must create the
+replicated table yourself for this workflow.
 
 ### 4. Preview, approve, delete, and verify
 
-Configure the matching database, prefix, disk, bucket, prefix, execution cluster,
-expected replicas, sample count, and age window. Refresh and compare references
+Keep the same database, table prefix, disk, bucket, object prefix, execution
+cluster, expected replicas, sample count, and age window. Refresh references
 from **all** consumers immediately before delete, and verify that candidate
 objects still have the reviewed metadata. Maintain the agreed period in which
 references cannot change and candidate keys cannot be overwritten or reused.
@@ -339,10 +358,9 @@ clean up private staging artifacts according to your retention policy.
 
 ## Advanced: configuration files and precedence
 
-Each parameter has a parser destination, shown below as its configuration key.
-Use that key in a JSON or YAML file passed with `--cfg`, or set the listed
-`S3GC_*` environment variable. For example, this non-secret JSON file selects a
-replica and enables a preview:
+The tables above list each parameter's configuration key. Use those keys in a
+JSON or YAML file passed with `--cfg`. For example, this file selects a replica
+and enables a preview:
 
 ```json
 {
@@ -362,7 +380,7 @@ The parser applies other environment variables after that environment-selected
 file. Keep secrets outside config files and shell history.
 
 `--help` (`-h`) prints CLI help. `--print_config` prints the effective parsed
-configuration and exits. **its output can contain credentials**, so do not
+configuration and exits. **Its output can contain credentials**, so do not
 share or commit it. `--list-options` (`--listoptions`) prints environment-style
 options and redacts configured credentials. These inspection options do not
 contact ClickHouse or S3. `--cfg` has environment variable `S3GC_CFG`. The help

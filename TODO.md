@@ -1,28 +1,23 @@
 # TODO
 
-Possible, interesting, and deliberately deferred engineering or operational
-improvements. Completed behaviour belongs in `CHANGELOG.md`; this file is the
-forward-looking backlog.
+Deferred engineering and operational work. Record completed changes in
+`CHANGELOG.md` and remove or update the item here.
 
-- [ ] Record collect progress so a crashed `--collectonly` run can resume.
-  `--collectafter` already starts listing after a given key, but nothing
-  records the last key listed, so after a crash the operator cannot tell what
-  to pass and restarts from the beginning. Write the last listed key
-  durably (for example in the run log) at each progress step.
+- [ ] Record the last listed key so an interrupted collect can resume.
+  `--collect-after` can start after a key, but collect does not save that key.
+  Write it durably at each progress step, for example in the run log.
 - [ ] Add an opt-in `dev_cluster` GCS end-to-end test. It must require explicit
   environment configuration, create an isolated tiered-policy fixture, run
   `collect → dry-run → delete → verify`, clean up ClickHouse and object-storage
   fixtures, and remain excluded from CI.
-- [ ] Require the `Container / test` GitHub Actions check before pull-request
-  merges in the repository branch-protection settings. `master` has no branch
-  protection or ruleset today; this needs a repository admin.
+- [ ] Have a repository admin require the `Container / test` GitHub Actions
+  check before pull-request merges. This item was recorded when `master` had
+  no branch protection or ruleset. Verify the current settings before changing them.
 - [ ] Surface a DDL `TIMEOUT_EXCEEDED` (159) instead of `IncompleteRead`. The
   server sends `200 OK` before a distributed DDL times out, so the HTTP client
-  hides the cause. The Replicated-database preflight covers a replica that is
-  already down; a replica that dies after the preflight still surfaces as
+  hides the cause. The Replicated-database preflight catches a replica already
+  reported down. A replica that dies after the check can still cause
   `IncompleteRead` after `distributed_ddl_task_timeout`.
-- [ ] Consider a `TTL` on the run-log table. Volume is a few hundred rows per
-  run so it is not urgent, but it grows without bound across many cleanups.
-  The run log is the durable record of what was deleted, so a TTL works
-  against its purpose: keep it off by default, or make it long (a year or
-  more).
+- [ ] Consider a run-log `TTL`. Each run adds a few hundred rows, and the table
+  grows across cleanups. It is the durable deletion record, so keep any TTL
+  disabled by default or retain at least a year of history.

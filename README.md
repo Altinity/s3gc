@@ -11,40 +11,37 @@ For customer and production work, use the Kubernetes runbook:
 collect → dry-run → explicit human approval → delete → verify
 ```
 
-Read the [Kubernetes Job runner](deploy/kubernetes/README.md) before you run a
-cleanup. It is the authoritative production procedure.
+Read the [Kubernetes Job runner](deploy/kubernetes/README.md) before a production
+cleanup. Use the [CLI reference](docs/cli-reference.md) for parameter details.
 
 ## Safety boundary
 
 Deleting an object is irreversible. `s3gc` preserves the following controls:
 
 - A delete Job needs the `DELETE_ORPHANS` confirmation token.
-- A clustered delete checks the configured cluster and expected replica count
-  before it calls S3.
-- When the auxiliary database uses `ENGINE = Replicated`, every phase checks
-  that all of its replicas are active in Keeper before it runs any DDL. With
-  `S3GC_REPLICA_LIVENESS_RECHECK=true` it checks again after the Keeper
-  session timeout (about 30 s, plus `S3GC_REPLICA_LIVENESS_MARGIN_MS`), to
-  catch a replica that crashed just before the run. A down replica would otherwise stall
-  each `CREATE TABLE` for `distributed_ddl_task_timeout` and surface only as
-  `IncompleteRead`.
+- A production delete checks the configured cluster and expected replica count
+  before deleting objects and before each sample.
+- Each phase checks replica liveness before DDL in a Replicated auxiliary
+  database. If ClickHouse cannot report liveness, the tool warns and skips that
+  check. See the [preflight options](docs/cli-reference.md#clickhouse-connection-and-topology)
+  for the optional delayed re-check.
 - A failed delete Job does not retry automatically. Confirmed batches remain
   checkpointed, so a replacement Job can resume with the same collection-table
   prefix.
-- `USEAGE` must be at least 24 hours outside development automation. This age
-  window protects a part that S3 has received before ClickHouse registers it.
+- Set `USEAGE_HOURS` to at least 24 in the renderer, or `S3GC_USEAGE` for a
+  direct run. This window protects objects uploaded before ClickHouse registers
+  their paths. Shorter windows are for isolated development fixtures only.
 - The Kubernetes renderer requires a digest-pinned image and keeps credentials
   outside the manifest.
 
-For an installation-wide cleanup, collect the parent prefix that holds every
-replica's objects and set the cluster name, so the comparison covers all
-replicas. A single-replica prefix misses the other replicas' orphans. Only
-collect a parent prefix that holds one `S3DISKNAME`'s objects — the orphan
-check matches by disk name, so another disk's objects under the same prefix
-would look orphaned.
+For a cleanup across one installation, collect the parent prefix that holds
+every replica's objects and set the cluster name. The comparison then covers
+all replicas. That prefix must contain objects for only the selected disk.
+Objects from another disk could otherwise appear orphaned.
 
 Use a unique collection-table prefix for each bucket and prefix. Never commit
 credentials, rendered manifests, target-cluster details, or run output.
+
 If independent clusters share an overlapping bucket or prefix, review references
 from every consumer before importing a candidate inventory. The
 [shared-bucket workflow](docs/cli-reference.md#manual-inventory-for-a-bucket-shared-by-independent-clusters)
@@ -81,8 +78,11 @@ export S3GC_COLLECTTABLEPREFIX='s3gc_example_'
 export S3GC_USEAGE=24
 ```
 
-Inject passwords and keys from a secret manager or your shell. Do not save them
-in a file or command history. Then run a preview:
+Provide passwords and keys through a secret manager or a private runtime
+environment. Keep them out of shell history and repository files. Create the
+auxiliary database and grants first, as described in the
+[runbook](deploy/kubernetes/README.md#3-provide-credentials-and-identity).
+Then run a preview:
 
 ```bash
 .venv/bin/python s3gc.py --verbose --dry-run
@@ -102,19 +102,20 @@ Choose one S3 authentication mode with `S3GC_S3AUTH`:
 
 | Mode | Credentials | Use it for |
 | --- | --- | --- |
-| `static` | `S3GC_S3ACCESSKEY` and `S3GC_S3SECRETKEY`; optional session token | explicit credentials from a secret manager |
-| `aws` | boto3 chain; optional `S3GC_S3PROFILE` | AWS SSO or a named workstation profile |
+| `static` | `S3GC_S3ACCESSKEY` and `S3GC_S3SECRETKEY`, with an optional session token | explicit credentials from a secret manager |
+| `aws` | boto3 chain, with optional `S3GC_S3PROFILE` | AWS SSO or a named workstation profile |
 | `iam` | MinIO workload-identity provider | EKS IRSA, EC2 instance profiles, or ECS task roles |
 
 Static mode does not read `AWS_ACCESS_KEY_ID` or `AWS_SECRET_ACCESS_KEY`. Pass
 those values as `S3GC_S3ACCESSKEY` and `S3GC_S3SECRETKEY`.
 
-`S3GC_S3PROFILE` selects `aws`; the tool rejects contradictory settings. An
-`aws` preview still needs `s3:ListBucket` for the configured bucket and prefix.
+`S3GC_S3PROFILE` selects `aws`. The tool rejects conflicting settings.
+Collection needs `s3:ListBucket`, including a preview that collects first.
+A preview with `--use-collected` reads the inventory without listing S3.
 
 GCS uses HMAC interoperability keys and usually names the object disk `gcs`.
 It does not support S3 batch deletion, so `s3gc` falls back to slower
-per-object deletion. Set `S3GC_S3DISKNAME=gcs`; do not use a `*_cache` disk as
+per-object deletion. Set `S3GC_S3DISKNAME=gcs`. Do not use a `*_cache` disk as
 the reference scope.
 
 ## Kubernetes deployment
@@ -132,7 +133,7 @@ Start with these links:
 Released images are public at `ghcr.io/altinity/s3gc`. Always use a digest:
 
 ```bash
-docker pull ghcr.io/altinity/s3gc@sha256:<digest>
+docker pull 'ghcr.io/altinity/s3gc@sha256:<digest>'
 ```
 
 CI publishes the exact `IMAGE=` value in its job summary. The renderer rejects
@@ -145,17 +146,10 @@ By default, each run writes structured events to
 starts, collect progress, deletion checkpoints, totals, warnings, and errors.
 It outlives the Job and rotated pod logs.
 
-Query one run on the same replica-pinned ClickHouse host:
-
-```sql
-SELECT event_time, phase, event, objects, bytes, message
-FROM   <db>.<prefix><disk>_log
-WHERE  run_id = '<job-name>'
-ORDER BY event_time;
-```
-
-Set `RUNLOG=false` only when stdout is an adequate record. A run-log failure
-falls back to stdout and does not stop a cleanup.
+See the [runbook](deploy/kubernetes/README.md#durable-run-history) for the query
+to inspect a run. Disable durable logging only when stdout is an adequate record.
+Use `RUNLOG=false` in renderer input or `S3GC_RUNLOG_FLAG=false` for a direct run.
+A run-log failure falls back to stdout and does not stop the cleanup.
 
 ## AI-agent skill
 
@@ -178,12 +172,10 @@ approve the reviewed dry-run result.
 `CLAUDE.md` (full guide) and `AGENTS.md` (short pointer) tell AI coding
 agents how to work here. For a new feature, bug fix, or behaviour change:
 
-1. **Spec Intake** — if the request is underspecified, the agent asks what
-   should happen instead, how to trigger it, whether it touches the delete
-   lifecycle, and known edge cases.
-2. **Spec** — a short problem statement and acceptance criteria, in the
-   commit that starts the change.
-3. **TDD** — a failing test per acceptance criterion, then made to pass.
+1. **Spec Intake:** ask for missing details, including expected behavior,
+   reproduction steps, safety impact, and edge cases.
+2. **Spec:** put the problem and acceptance criteria in the starting commit.
+3. **TDD:** write a failing test for each criterion, then make it pass.
 
 Editorial changes (docs, comments) skip this. See `CLAUDE.md` for the full
 rules.

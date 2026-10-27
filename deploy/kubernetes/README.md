@@ -13,8 +13,8 @@ python3.11 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt -r requirements-dev.txt
 ```
 
-`render.py` uses only the Python standard library. The runbook still uses
-`.venv/bin/python` so every command runs with the supported Python version.
+Use `.venv/bin/python` for these commands. The renderer itself needs only the
+Python standard library.
 
 ## Runbook
 
@@ -45,35 +45,43 @@ contains no credentials.
 
 ### 2. Confirm the cleanup scope
 
-Set the values in `s3gc.env`, then check these five items before rendering:
+Set these values in `s3gc.env` before rendering:
 
-1. Set `CHHOST` to one per-replica ClickHouse Service and use the same host for every phase. The inventory table is node-local; a load-balanced Service can send a later phase to a replica without that table.
-2. Set the exact bucket, prefix, and underlying object-disk name. `S3PATH` may be empty. GCS commonly uses `gcs`; never use a `*_cache` disk.
-3. Set the actual `CLUSTERNAME` and `EXPECTED_REPLICAS` for clustered cleanup. Delete fails closed if this preflight does not match.
-4. Set `COLLECTDATABASE` to the auxiliary database, and choose a unique `COLLECTTABLEPREFIX` such as `s3gc_<run>_`. Keep the prefix after a partial delete so the replacement Job can use the deletion checkpoints. Without `COLLECTDATABASE`, the auxiliary table lands in the ClickHouse user's current database, which can differ from `default` and cause a grant failure; `COLLECTTABLEPREFIX` still accepts an embedded `db.prefix_` form for compatibility, but a value there that disagrees with `COLLECTDATABASE` is rejected at startup.
-5. Set `USEAGE_HOURS` to 24 or more. Raise it for slow merges or long mutations; production phases cannot lower it.
+| Setting | What to check |
+| --- | --- |
+| `CHHOST` | Use one per-replica ClickHouse Service for every phase. The default inventory is node-local. A load-balanced Service can reach a replica without it. |
+| `S3BUCKET`, `S3PATH`, `S3DISKNAME` | Match the exact bucket, object prefix, and underlying disk. An empty `S3PATH` selects the bucket root. Use `gcs` for a disk named `gcs`, never a `*_cache` wrapper. |
+| `CLUSTERNAME`, `EXPECTED_REPLICAS` | Match the actual cluster and total replica count. Delete stops if the preflight result differs. |
+| `COLLECTDATABASE`, `COLLECTTABLEPREFIX` | Use the auxiliary database and a unique prefix such as `s3gc_<run>_`. Keep both unchanged during recovery. |
+| `USEAGE_HOURS` | Use 24 or more. Raise it for slow merges or long mutations. Production phases reject a lower value. |
 
-For an installation-wide cleanup, set `S3PATH` to the parent prefix that
-contains every replica's objects, such as `clickhouse/<installation>/`, not a
-single `<installation>/<replica>/` prefix — but only when that parent prefix
-holds objects for the one `S3DISKNAME` being cleaned up. The orphan check
-matches ClickHouse's `system.remote_data_paths` by `disk_name`, so an object
-that belongs to a different disk stored under the same parent prefix would
-never match and would look orphaned. When disks share a parent prefix, collect
-a disk-scoped prefix instead, or give each disk its own S3 path layout.
-Collect the chosen prefix once into one inventory table on the pinned host.
-With `CLUSTERNAME` set, dry-run and delete compare
-the inventory with `system.remote_data_paths` on all replicas, so an object
-that any replica still references is never a candidate. A single-replica
-prefix misses the other replicas' orphans. Collect per-replica prefixes only
-when you intend to, and give each one its own `COLLECTTABLEPREFIX`.
+Without `COLLECTDATABASE`, the inventory uses the ClickHouse user's current
+database. That database may differ from the one you granted access to.
+The older `db.prefix_` form still works in `COLLECTTABLEPREFIX`, but its database
+must agree with `COLLECTDATABASE` when both are set.
+
+For a cleanup across one installation, collect the parent prefix that holds all
+replicas' objects, such as `clickhouse/<installation>/`. Set `CLUSTERNAME` so
+the comparison reads references from every configured replica. Collecting only
+`<installation>/<replica>/` misses the other replicas' orphans.
+
+The selected prefix must contain objects for only the chosen disk. References
+are matched by disk name, so another disk's objects could look orphaned. Use a
+disk-specific prefix when possible. For intentional per-replica runs, give each
+prefix its own inventory table.
+
+If independent clusters or other consumers share the selected scope, follow
+the [manual inventory workflow](../../docs/cli-reference.md#manual-inventory-for-a-bucket-shared-by-independent-clusters).
+Check every consumer before importing candidates. The configured cluster check
+cannot see references in other clusters. After importing the reviewed inventory,
+start with the dry-run phase and skip collection.
 
 Use an immutable multi-architecture image digest in `IMAGE`. CI prints the
 exact value after publishing. Do not use an image tag.
 
 Collection has no resume checkpoint. For a large bucket, collect separate
-prefix shards and rerun only a failed shard. Re-listing a shard is safe because
-the auxiliary table replaces rows by object path.
+prefix shards and rerun only a failed shard. The inventory replaces rows with
+the same object path. Do this before deletion, not while recovering a delete.
 
 ### 3. Provide credentials and identity
 
@@ -85,12 +93,11 @@ Create or reuse the Kubernetes Secret named by `CREDENTIALS_SECRET`:
 | `iam` | `S3GC_CHUSER` and `S3GC_CHPASS` |
 | `aws` | `S3GC_CHUSER`, `S3GC_CHPASS`, plus a credential source available to boto3 |
 
-Set `SERVICE_ACCOUNT` to an existing namespace-local ServiceAccount that your
-cluster configures for the chosen workload-identity mode. The Job keeps
-`automountServiceAccountToken: false` because it does not call the Kubernetes
-API. For `iam`, the platform must inject or otherwise provide the workload
-identity credentials. Existing ClickHouse or ClickHouse-backup ServiceAccounts
-are suitable when they meet that cluster policy.
+Set `SERVICE_ACCOUNT` to an existing ServiceAccount in the namespace. For `iam`,
+the platform must provide workload-identity credentials for that account.
+The Job keeps `automountServiceAccountToken: false` because it does not call the
+Kubernetes API. An existing ClickHouse or ClickHouse-backup ServiceAccount is
+suitable if it meets the cluster's identity policy.
 
 Create a dedicated auxiliary database and ClickHouse user before the first run.
 Replace `<cluster-name>`, `<auxiliary-database>`, and the password placeholder.
@@ -105,7 +112,9 @@ ON CLUSTER <cluster-name>
 IDENTIFIED WITH sha256_password BY '<strong-password>';
 
 GRANT ON CLUSTER <cluster-name>
-    SELECT ON system.* TO s3gc;
+    SELECT ON system.remote_data_paths,
+    SELECT ON system.one,
+    SELECT ON system.clusters TO s3gc;
 
 GRANT ON CLUSTER <cluster-name>
     SELECT, INSERT, CREATE TABLE ON <auxiliary-database>.* TO s3gc;
@@ -114,13 +123,30 @@ GRANT ON CLUSTER <cluster-name>
     REMOTE ON *.* TO s3gc;
 ```
 
+The system-table grants are by name, so the user cannot read `system.query_log`
+or other tables that may hold restricted data. `system.remote_data_paths` is the
+reference s3gc compares the inventory with, `system.one` backs the replica-count
+preflight of the delete phase, and `system.clusters` backs the replica-liveness
+check for a Replicated auxiliary database. s3gc also reads `system.databases`
+and `system.tables`; on the version this was checked on (26.8) any user can
+read those two, limited to the objects it has access to, so they need no grant.
+
 The database grant covers the auxiliary inventory and durable run-log tables.
 `REMOTE` permits the `clusterAllReplicas` reads used by clustered dry-run and
-delete preflight. When `<auxiliary-database>` uses `ENGINE = Replicated`, every
-phase, including collect, first checks that all of that database's replicas are
-active in Keeper (`S3GC_REPLICA_LIVENESS_RECHECK=true` adds a re-check after one
-Keeper session timeout, about 30 s); this reads only system tables and needs no extra grant. Do not grant ClickHouse's `S3` source privilege: s3gc uses
-its own S3 client and the Secret or workload identity instead.
+delete preflight. These grants support the normal phases, which preserve the
+inventory after delete. Optional DROP or TRUNCATE operations need their own
+grants.
+
+For a Replicated auxiliary database, every phase checks replica liveness before
+DDL. If ClickHouse cannot report liveness or returns no replicas, s3gc warns and
+skips that check. An optional delayed re-check uses the Keeper session timeout
+reported by the cluster. See the [CLI preflight options](../../docs/cli-reference.md#clickhouse-connection-and-topology).
+The optional delayed re-check also reads `system.zookeeper_connection`. Grant
+`SELECT ON system.zookeeper_connection` only if you pass
+`--replica-liveness-recheck`; without the grant that flag warns and skips the
+re-check.
+
+s3gc uses its own S3 client. It does not need ClickHouse's `S3` source privilege.
 
 For `S3AUTH=static`, create the Secret from a private, shell-style credential
 file. Keep this file outside the repository, restrict it to its owner, and
@@ -162,7 +188,7 @@ if [ -n "${S3GC_S3SESSIONTOKEN:-}" ]; then
   literals+=(--from-literal=S3GC_S3SESSIONTOKEN="$S3GC_S3SESSIONTOKEN")
 fi
 
-kubectl -n <namespace> create secret generic <credentials-secret-name> \
+kubectl -n '<namespace>' create secret generic '<credentials-secret-name>' \
   "${literals[@]}"
 
 unset S3GC_CHUSER S3GC_CHPASS S3GC_S3ACCESSKEY S3GC_S3SECRETKEY S3GC_S3SESSIONTOKEN
@@ -174,15 +200,16 @@ object keys. Keep delete permission separate until an approved delete phase.
 
 ### 4. Run each phase
 
-For each phase, edit only the values shown below, render the Job, server-side
-validate it, apply it, and follow its logs:
+For each phase, change the values in the table below. Render the Job, validate
+it against the API server, apply it, and follow its logs. Replace the
+placeholders before running these commands:
 
 ```bash
 .venv/bin/python deploy/kubernetes/render.py "$S3GC_RUN_DIR/s3gc.env" \
   > "$S3GC_RUN_DIR/<phase>.yaml"
 kubectl apply --dry-run=server -f "$S3GC_RUN_DIR/<phase>.yaml"
 kubectl apply -f "$S3GC_RUN_DIR/<phase>.yaml"
-kubectl -n <namespace> logs -f job/<job-name>
+kubectl -n '<namespace>' logs -f 'job/<job-name>'
 ```
 
 | Phase | Change in `s3gc.env` | Required outcome |
@@ -198,26 +225,38 @@ for a bounded trial delete. Clear it before the full run and verification.
 The use-phase query applies this limit separately to each sample, so it is not
 a global cap on the Job.
 
-The entrypoint uses `--collectonly --keepdata` for collection,
-`--usecollected --dry-run` for review and verification, and
-`--usecollected --keepdata --non-interactive` for delete after the token and
-topology-input gates. See the [CLI reference](../../docs/cli-reference.md) for
-all parameters and the [manual shared-bucket workflow](../../docs/cli-reference.md#manual-inventory-for-a-bucket-shared-by-independent-clusters).
+The entrypoint selects the CLI flags for each phase:
+
+| Phase | CLI flags |
+| --- | --- |
+| Collect | `--collectonly --keepdata` |
+| Dry-run and verify | `--usecollected --dry-run` |
+| Delete | `--usecollected --keepdata --non-interactive`, after the token and cluster-input gates |
+
+See the [CLI reference](../../docs/cli-reference.md) for parameter details.
 
 ### 5. Recover or verify
 
 If a delete Job fails, create a replacement delete Job with a new `JOB_NAME`
-and the same `COLLECTTABLEPREFIX`. Do not re-collect unless the scope changed.
-`backoffLimit: 0` prevents automatic retries.
+and the same host, scope, and inventory settings. Inspect the failure and confirm
+that the approval still applies first. Do not re-collect or drop the inventory
+during recovery. A changed scope needs a new inventory, review, and approval.
+`backoffLimit: 0` prevents automatic Job reruns. Individual S3 requests can still
+retry within the running process.
 
 After a successful delete, run the verification dry-run. Do not declare the
-cleanup complete until it reports zero candidates.
+cleanup complete until it reports zero candidates with `USETOTAL` cleared.
+That result covers the reviewed inventory and age window. It does not check
+new objects absent from the inventory or prove the bucket is empty.
 
 ## Configuration reference
 
 `render.py` reads a non-secret `KEY=VALUE` file. It rejects missing required
 values, unpinned images, invalid phases, invalid booleans, and unsafe age
 windows. Start with [example.env](example.env).
+
+Renderer keys differ from CLI environment names. For example, `USEAGE_HOURS`
+becomes `S3GC_USEAGE`, and `RUNLOG` becomes `S3GC_RUNLOG_FLAG`.
 
 | Group | Required values | Notes |
 | --- | --- | --- |
@@ -227,13 +266,13 @@ windows. Start with [example.env](example.env).
 | Limits | `SAMPLES`, `DELETE_BATCH_SIZE`, `USEAGE_HOURS`, `ACTIVE_DEADLINE_SECONDS`, `TTL_SECONDS_AFTER_FINISHED`, `MEMORY_REQUEST`, `MEMORY_LIMIT` | Keep `SAMPLES` unchanged after collect for partition pruning. |
 | Behavior | `PHASE`, `DELETE_CONFIRMATION`, `ORDER_BY_OBJPATH`, `VERBOSE` | The renderer requires the confirmation token for delete and development automation. |
 
-`USETOTAL` is optional and limits each sample in a use phase. `RUNLOG` defaults to `true`;
-set it to `false` only when stdout is an adequate operational record.
+`USETOTAL` is optional and limits each sample in a use phase. `RUNLOG` defaults
+to `true`. Set it to `false` only when stdout is an adequate operational record.
 
 ## Durable run history
 
-Pod logs are for monitoring, not durable evidence. The kubelet rotates them,
-and the Job TTL removes the pod. By default, `s3gc` writes run events to
+The kubelet rotates pod logs, and the Job TTL removes the pod. By default,
+`s3gc` also writes durable run events to
 `<COLLECTTABLEPREFIX><S3DISKNAME>_log` in ClickHouse.
 
 Use the same replica-pinned host to inspect a run:
@@ -255,12 +294,14 @@ the cleanup.
 with a fresh inventory and requires `DELETE_CONFIRMATION=DELETE_ORPHANS`,
 `CLUSTERNAME`, and `EXPECTED_REPLICAS`.
 
-Use it only for isolated development fixtures. It bypasses the manual review
-and approval gate, and it alone may use an age window below 24 hours.
+Use it only for isolated development fixtures. It runs all three phases without
+a pause for manual review. The renderer allows an age window below 24 hours
+only for this phase, and the entrypoint passes the development override.
+Never use it for customer or production data.
 
 ## Preserved safeguards
 
 - The manifest runs as a non-root user with a read-only root filesystem and no Linux capabilities.
 - Credentials come from `CREDENTIALS_SECRET` or workload identity, never the image or environment file.
 - The renderer requires a digest-pinned image and validates delete confirmation before the Job reaches the cluster.
-- Delete requires the cluster/replica preflight, records checkpoints, and never retries automatically.
+- A delete Job requires the cluster/replica preflight and records checkpoints. A failed Job is not rerun automatically.

@@ -20,8 +20,9 @@ selected disk and cluster. Use the Kubernetes runbook for production.
 - Pin `CHHOST` to one per-replica ClickHouse Service for every phase. The
   default inventory is node-local. Keep the same pinned host even when using
   a manually created replicated inventory.
-- Require the actual cluster name and expected replica count. Delete must
-  pass the cluster/replica preflight before deleting any objects.
+- For clustered cleanup, require the actual cluster name and expected replica
+  count. Delete must pass the cluster/replica preflight before deleting objects.
+  The Kubernetes delete workflow requires both settings.
 - Use a unique `COLLECTTABLEPREFIX` for each cleanup scope. Keep it after a
   partial delete so a replacement Job can use the confirmed checkpoints.
 - Keep `USEAGE_HOURS` at 24 or more for production. This protects objects
@@ -56,15 +57,21 @@ independent clusters. Stop if the review cannot cover every consumer.
 
 ### 2. Collect and review
 
-Run `collect`, then `dry-run`, against the same host and inventory. Collection
-does not delete objects. Dry-run reports the candidate count and size. Review
-the bucket and prefix too. Store the configuration location and Job/log evidence
-in the authorized support record without copying credentials or artifacts into Git.
+Choose the inventory path before running a Job:
 
-For a manually imported inventory, skip collect and start with dry-run.
-`--use-collected` reads the existing table without listing S3 again. Keep the
-all-consumer reference review current through deletion, as the manual workflow
-requires.
+- For normal collection, run `collect`, then `dry-run`.
+- For a manually imported inventory, skip `collect` and start with `dry-run`.
+  Never re-collect into the reviewed candidate table.
+
+Use the same pinned host and inventory for subsequent phases.
+`--use-collected` reads the existing table without listing S3 again. For a manual
+inventory, keep the all-consumer reference review current through deletion, as
+the manual workflow requires.
+
+Collection does not delete objects. Dry-run reports the candidate count and
+size. Review the bucket and prefix too. Store the configuration location and
+only redacted, non-secret Job/log evidence in the authorized support record.
+Keep credentials and customer artifacts out of Git.
 
 Investigate a missing or empty inventory before proceeding. Check the prefix,
 disk, and pinned host. For large buckets, collect separate prefix shards.

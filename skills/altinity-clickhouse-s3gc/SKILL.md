@@ -5,79 +5,102 @@ description: Safely investigate, plan, review, and execute cleanup of orphaned o
 
 # ClickHouse S3 Garbage Collection
 
-Use this skill for the `s3gc` workflow only: identifying objects in a configured object-store
-bucket/prefix that are absent from ClickHouse `system.remote_data_paths`, reviewing candidates,
-and removing approved orphaned objects. It is not a generic S3 cleanup procedure.
+Use this skill to find, review, and remove approved orphaned objects with s3gc.
+It compares an inventory with ClickHouse `system.remote_data_paths` for the
+selected disk and cluster. Use the Kubernetes runbook for production.
 
 ## Non-negotiable rules
 
-- Deletion is irreversible. For customer and production work, use the Kubernetes Job workflow:
-  **collect → dry-run → explicit human approval → delete → verify**.
-- Scope the bucket and prefix as narrowly as possible. A wrong prefix can produce a misleading
-  clean result or expand deletion scope.
-- Use the underlying object disk (for example `s3` or `gcs`) for `S3DISKNAME`, never its
-  `*_cache` wrapper. The cache does not represent a separate object-reference scope.
-- Pin `CHHOST` to a per-replica ClickHouse Service, and use the same host for every phase. The
-  auxiliary inventory table is node-local; a load-balanced Service can send phases to different
-  replicas and invalidate the result.
-- For clustered cleanup, require the actual cluster name and expected replica count. The delete
-  phase must pass `s3gc`'s cluster/replica preflight before any S3 call.
-- Use a unique `COLLECTTABLEPREFIX` for each bucket/prefix cleanup. Preserve it after a partial
-  delete: confirmed deletions are checkpointed, and a replacement delete Job resumes from that
-  state without re-collecting.
-- Keep `USEAGE_HOURS` at 24 or higher for production phases. This protects objects uploaded to S3
-  before ClickHouse has registered their paths.
-- An agent must not supply `DELETE_ORPHANS`, create a delete manifest with that token, or bypass
-  the reviewed dry-run gate. A human must review the immediate dry-run output and explicitly
-  authorize deletion.
-- Never commit or record credentials, customer `.env` files, rendered manifests, bucket names,
-  cluster identifiers, or command output containing them. Keep run material outside this repo and
-  use Kubernetes Secrets or workload identity.
+- Deletion is irreversible. Follow **collect → dry-run → explicit human approval
+  → delete → verify** for customer and production work.
+- Limit the bucket and prefix to the intended scope. A wrong prefix can hide
+  orphans or include objects you must not delete.
+- Set `S3DISKNAME` to the underlying object disk, such as `s3` or `gcs`.
+  Never use its `*_cache` wrapper.
+- Pin `CHHOST` to one per-replica ClickHouse Service for every phase. The
+  default inventory is node-local. Keep the same pinned host even when using
+  a manually created replicated inventory.
+- For clustered cleanup, require the actual cluster name and expected replica
+  count. Delete must pass the cluster/replica preflight before deleting objects.
+  The Kubernetes delete workflow requires both settings.
+- Use a unique `COLLECTTABLEPREFIX` for each cleanup scope. Keep it after a
+  partial delete so a replacement Job can use the confirmed checkpoints.
+- Keep `USEAGE_HOURS` at 24 or more for production. This protects objects
+  uploaded before ClickHouse registers their paths.
+- An agent must not supply `DELETE_ORPHANS`, create a delete manifest with that
+  token, or bypass dry-run review. A human must review the immediate dry-run
+  output and explicitly authorize deletion.
+- Never record credentials. Keep customer configuration, rendered manifests,
+  bucket names, cluster identifiers, and their output outside Git. Use a private
+  run directory and the authorized support record for run evidence.
+  Provide credentials through Kubernetes Secrets or workload identity.
 
 ## Workflow
 
 ### 1. Establish the cleanup scope
 
-Before collecting, record the purpose, affected disk, endpoint, bucket, exact prefix, ClickHouse
-cluster, expected replica count, namespace, and per-replica `CHHOST`. Confirm the intended S3
-authentication mode and the minimum ClickHouse/S3 permissions. Prefer workload identity (`iam`)
-for an in-cluster AWS cleanup; use static credentials only from a runtime Secret.
+Record the purpose, disk, endpoint, bucket, prefix, cluster, expected replicas,
+namespace, and pinned host in the private run record. Confirm the authentication
+mode and required ClickHouse and S3 permissions. Prefer `iam` for in-cluster AWS
+work. Supply static credentials only through a runtime Secret.
 
-Read [the Kubernetes operator guide](../../deploy/kubernetes/README.md) and start from
-[`deploy/kubernetes/example.env`](../../deploy/kubernetes/example.env) copied to a private run
-directory outside the repository. Use an immutable multi-architecture image digest, not a tag.
-Select an existing namespace-local ServiceAccount configured for the cluster's intended workload
-identity mode; the runner does not need Kubernetes API credentials.
+Read the [Kubernetes runbook](../../deploy/kubernetes/README.md). Copy
+[example.env](../../deploy/kubernetes/example.env) to the private run directory.
+Use a multi-architecture image pinned by digest and an existing ServiceAccount
+configured for the intended identity. The Job does not need Kubernetes API access.
+
+If independent clusters share the scope, follow the
+[manual inventory workflow](../../docs/cli-reference.md#manual-inventory-for-a-bucket-shared-by-independent-clusters).
+Check references from every cluster, replica, relevant disk, and other consumer.
+Import only reviewed candidates. s3gc's configured-cluster check cannot see
+independent clusters. Stop if the review cannot cover every consumer.
 
 ### 2. Collect and review
 
-Render and run a `collect` Job, then a `dry-run` Job against the same `CHHOST` and collection
-table. Collect does not delete; dry-run reports the candidate count and size. Review the exact
-bucket and prefix too. Capture the rendered configuration location and the non-secret Job/log
-evidence in the active support record without copying credentials or customer artifacts into Git.
+Choose the inventory path before running a Job:
 
-Treat an empty or missing collected inventory as a failure to investigate, not proof that the
-bucket is clean. Verify the prefix, disk name, and replica-pinned service first. For large buckets,
-shard collection by prefix; interrupted collection has no checkpoint and must be rerun only for
-the affected shard.
+- For normal collection, run `collect`, then `dry-run`.
+- For a manually imported inventory, skip `collect` and start with `dry-run`.
+  Never re-collect into the reviewed candidate table.
+
+Use the same pinned host and inventory for subsequent phases.
+`--use-collected` reads the existing table without listing S3 again. For a manual
+inventory, keep the all-consumer reference review current through deletion, as
+the manual workflow requires.
+
+Collection does not delete objects. Dry-run reports the candidate count and
+size. Review the bucket and prefix too. Store the configuration location and
+only redacted, non-secret Job/log evidence in the authorized support record.
+Keep credentials and customer artifacts out of Git.
+
+Investigate a missing or empty inventory before proceeding. Check the prefix,
+disk, and pinned host. For large buckets, collect separate prefix shards.
+Interrupted collection has no checkpoint. Rerun only the failed shard before
+deletion, not while recovering a delete.
 
 ### 3. Require approval and delete
 
-Present the dry-run candidate count, size, exact bucket/prefix scope, and any uncertainty to the
-authorized customer/operator. Do not proceed without explicit approval.
+Present the candidate count, size, exact scope, and any uncertainty to the
+authorized operator. Do not proceed without explicit approval.
 
-After the human supplies the delete confirmation in the private runtime configuration, render a
-new delete Job using the same collection-table prefix. Monitor it to completion. A failed delete
-Job has no automatic retry; start a replacement delete Job with the same prefix so the confirmed
-deletion checkpoints are preserved. Do not re-collect unless the scope itself changed. Keep the
-durable run log enabled unless stdout is the approved operational record.
+After the human supplies the token in the private configuration, render a new
+delete Job with the same host, scope, and inventory. Monitor it to completion.
+Keep the durable run log enabled unless stdout is the approved record.
+
+A failed Job is not rerun automatically. Individual S3 requests can retry within
+the process. Inspect the failure and confirm that approval still applies before
+starting a replacement Job. Preserve the inventory and checkpoints. Do not
+re-collect during recovery. A changed scope needs a new inventory, review, and
+approval.
 
 ### 4. Verify and hand off
 
-Run the final `dry-run` phase against the same host and inventory. It must report zero remaining
-candidates before declaring the cleanup complete. Record the approved scope, image digest,
-cluster/replica preflight result, candidate and deleted totals, verification result, and any
-partial-failure recovery steps in the active ticket's handoff record.
+Run a final dry-run against the same host and inventory with `USETOTAL` cleared.
+It must report zero candidates before the cleanup is complete. That result
+covers the reviewed inventory and age window, not newly uploaded objects.
+
+Record the approved scope, image digest, preflight result, candidate and deleted
+totals, verification result, and recovery steps in the authorized handoff record.
 
 ## References
 
@@ -86,4 +109,5 @@ partial-failure recovery steps in the active ticket's handoff record.
 - [s3gc README](../../README.md) — tool model, authentication modes, direct read-only usage, and
   local development checks.
 - [`deploy/kubernetes/example.env`](../../deploy/kubernetes/example.env) — non-secret renderer
-  template; copy it only to a private run directory.
+  template. Copy it only to a private run directory.
+- [CLI reference](../../docs/cli-reference.md) — parameter details and manual inventory preparation.

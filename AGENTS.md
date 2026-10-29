@@ -2,9 +2,8 @@
 
 Read `CLAUDE.md`, `CHANGELOG.md`, and `TODO.md` before making substantive
 changes in this repository. `CLAUDE.md` is the full contributor guide and the
-primary source of truth; the changelog provides recent historical context and
-the TODO file records possible, interesting, and deliberately deferred
-improvements.
+primary source of truth. The changelog explains completed changes, and the TODO
+file records deferred work.
 
 This file is intentionally short so agent tooling can find the critical rules
 quickly, then defer to `CLAUDE.md` for complete repository guidance.
@@ -23,16 +22,18 @@ quickly, then defer to `CLAUDE.md` for complete repository guidance.
    answer that, run Spec Intake first (see `CLAUDE.md`). Then use test-driven
    development to satisfy each criterion. Run the relevant offline pytest
    suite and Kubernetes renderer/manifest dry-run checks described in
-   `CLAUDE.md`. Automated tests must not contact live ClickHouse or object
-   storage, or delete objects.
+   `CLAUDE.md`. Purely editorial changes are exempt from spec and TDD.
+   Default tests must stay offline and must not delete objects. Tests marked
+   `dev_cluster` require explicit opt-in and an isolated development environment.
+   They never run in CI.
 4. **No secrets or customer data in Git.** Never commit credentials, customer
    configuration, target-cluster details, or rendered customer manifests. Use
    Kubernetes Secrets or workload identity for production credentials.
 5. **Keep deployments immutable and least-privileged.** Preserve digest-pinned
    images, non-root/read-only container settings, and renderer validation.
-6. **Keep dependencies deliberate.** Production dependencies belong in
-   `requirements.txt`; testing-only dependencies belong in
-   `requirements-dev.txt`. Do not add either casually.
+6. **Keep dependencies deliberate.** Pin production dependencies in
+   `requirements.txt` and testing-only dependencies in `requirements-dev.txt`.
+   Add or update one only when the task needs it, and verify the workflow.
 
 ## Working rule
 

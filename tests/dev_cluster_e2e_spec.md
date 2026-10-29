@@ -1,5 +1,10 @@
 # Dev-cluster E2E spec
 
+Historical acceptance criteria for the test now implemented in
+[test_s3gc_dev_cluster.py](test_s3gc_dev_cluster.py). See its explicit opt-in
+requirements before using an isolated development cluster. These criteria are
+not instructions to run a live test as part of the default suite.
+
 Add an opt-in test that validates s3gc's Replicated-database preflight and
 cross-replica inventory checkpoints against an isolated development ClickHouse
 cluster and S3 prefix. The test must never run in the default pytest suite.

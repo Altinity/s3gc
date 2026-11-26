@@ -110,3 +110,29 @@ are implemented and validated.
 - [ ] Consider a run-log `TTL`. Each run adds a few hundred rows, and the table
   grows across cleanups. It is the durable deletion record, so keep any TTL
   disabled by default or retain at least a year of history.
+
+## Per-key S3 delete retries
+
+- [ ] **Retry transient per-key `DeleteObjects` errors.** Two production
+  attempts stopped after S3 reported `InternalError` for one key in the first
+  attempt and three keys in a later attempt. S3GC checkpointed the successful
+  deletions in each mixed batch and then raised `S3DeletionError`. The logs
+  establish the error code. The specific cause inside S3 is unknown.
+  `DeleteObjects` can return HTTP 200 with per-key errors in the response body.
+  MinIO yields those errors to `do_use()`, so neither the HTTP status retries
+  nor `remove_objects_reconnecting()` handles them. AWS recommends retrying
+  `InternalError`. [S3 DeleteObjects API](https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html)
+  · [S3 error best practices](https://docs.aws.amazon.com/AmazonS3/latest/developerguide/ErrorBestPractices.html)
+
+  - Retry only failed, unambiguously identified keys with an allowlisted
+    transient code, starting with `InternalError`. Use exponential backoff
+    with jitter and bounded attempts and elapsed time. Account for the open
+    ClickHouse result stream when choosing the retry budget.
+  - Checkpoint confirmed successes once and keep unresolved keys active. Fail
+    closed on authorization errors, unknown keys, ambiguous outcomes, or a
+    spent retry budget. Preserve the approved scope and object identity across
+    retries, including provider differences and keys that can be replaced.
+  - Log the S3 error code, attempt count, result and request ID when available.
+    Keep Kubernetes Job replacement under operator control. Add offline tests
+    for mixed success and retry, budget exhaustion, permanent or ambiguous
+    errors, and checkpoint counts without double-counting.
